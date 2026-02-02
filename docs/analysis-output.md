@@ -1,172 +1,131 @@
-# Audio Architecture
+# analysis.json Output Contract
 
-Protected audio streaming for Pain Cave workouts.
+The `analysis.json` file is the primary output of this project and the contract between the Python analysis pipeline and the TypeScript consumer apps (UI, Studio, server).
 
-## Local Development
+## Source of Truth
 
-```
-User → Vite dev server → /tracks/{hash}/audio.m4a
-                              ↓
-                    Served from public/
-```
-
-- Audio files stored in `tracks/{hash}/`
-- Vite serves static files directly during development
-- No auth required locally (add when needed)
-
-## Production
+**The canonical schema lives in the main paincave repo:**
 
 ```
-User (with JWT) → Cloudflare Worker → R2 Bucket
-                        ↓
-                  API /api/audio/verify
+../paincave/shared/schemas/analysis.schema.json
 ```
 
-- Audio files stored in Cloudflare R2 (zero egress cost)
-- Cloudflare Worker validates access via API endpoint
-- `audio.mysterious.cloud` → Worker route
+This JSON Schema defines every field, its type, and whether it's required. Both the TypeScript interface (`AnalysisJson` in `shared/repositories/types.ts`) and this pipeline's output must conform to it.
 
-## Folder Structure
+**If you change the output shape of `analyze.py`, the schema must be updated first in the main repo.**
 
+## Current Version: 3.0
+
+All field names are **camelCase** for direct TypeScript consumption.
+
+### Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | Schema version (`"3.0"`) |
+| `duration` | number | Track duration in seconds |
+| `sampleRate` | integer | Audio sample rate in Hz (44100) |
+| `bpm` | number | Global BPM (median of tempo curve) |
+| `firstDownbeat` | number | Time in seconds of bar 1, beat 1 |
+| `beats` | array | Beat grid — see below |
+
+### Optional Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hash` | string | Content hash of the audio file |
+| `key` | string \| null | Musical key (e.g. `"C major"`) |
+| `workZones` | array | Bar ranges classified as work/breakdown |
+| `raw` | object | Raw signal data for visualization |
+
+### beats[]
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `t` | number | yes | Time in seconds |
+| `bar` | integer | yes | Bar number (1-based) |
+| `beat` | integer | yes | Beat within bar (1-based) |
+| `confidence` | number | no | Detection confidence (0–1) |
+
+### workZones[]
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | no | `"work"` or `"breakdown"` |
+| `startBar` | integer | yes | First bar (1-based) |
+| `endBar` | integer | yes | Last bar (1-based, exclusive) |
+| `startSec` | number | yes | Start time in seconds |
+| `endSec` | number | yes | End time in seconds |
+| `avgDensity` | number | no | Average kick density (0–1) |
+| `hint` | string | no | Human-readable zone description |
+
+### raw
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `beatTimes` | number[] | All detected beat times in seconds |
+| `bassEnergy` | number[] | Bass band energy (20–150 Hz) per second |
+
+## Validation
+
+Use the JSON Schema to validate output before writing:
+
+```python
+import json
+import jsonschema
+from pathlib import Path
+
+SCHEMA_PATH = Path(__file__).resolve().parents[2] / "paincave" / "shared" / "schemas" / "analysis.schema.json"
+
+def validate_analysis(data: dict) -> None:
+    schema = json.loads(SCHEMA_PATH.read_text())
+    jsonschema.validate(data, schema)
 ```
-tracks/
-  {content-hash}/           # SHA256 hash of audio
-    audio.m4a               # The audio file
-    analysis.json           # Beat grid, kick zones, raw data
-    peaks/                  # Waveform data for visualization
-      data.json             # Peaks metadata
-      *.dat                 # Binary peak files
-```
 
-- **Content hash** uniquely identifies each track
-- **Analysis** contains beat grid, tempo, kick zones
-- **Peaks** used by waveform component
+## Peaks Output
 
-## File Formats
+Peaks are a separate concern from analysis. Written to `peaks/` subdirectory with four resolutions:
 
-### analysis.json
+| File | samples/peak | Use |
+|------|-------------|-----|
+| `overview.json` | 16384 | Zoomed-out waveform |
+| `medium.json` | 4096 | Medium zoom |
+| `detail.json` | 1024 | Zoomed-in waveform |
+| `tiny.json` | ~N bars | Track list thumbnails (normalized 0–1 amplitude) |
+
+Each peaks file (except tiny) has the shape:
 
 ```json
 {
-  "version": "2.0",
-  "duration": 180.5,
-  "sample_rate": 44100,
-  "bpm": 128,
-  "first_downbeat": 0.33,
-
-  "beats": [
-    { "t": 0.33, "bar": 1, "beat": 1 },
-    { "t": 0.75, "bar": 1, "beat": 2 }
-  ],
-
-  "kick_zones": [
-    { "type": "kicks", "start_bar": 1, "end_bar": 16, "start_t": 0.33, "end_t": 30.0, "avg_density": 0.85 }
-  ],
-
-  "raw": {
-    "beat_times": [0.33, 0.75, 1.17, ...],
-    "bass_energy": [0.2, 0.8, 0.9, ...]
-  }
+  "sampleRate": 44100,
+  "duration": 1800.5,
+  "samplesPerPeak": 4096,
+  "peaks": [[min, max], [min, max], ...]
 }
 ```
 
-### Database Schema (tracks table)
+`tiny.json` has a different shape:
 
-```typescript
+```json
 {
-  hash: string          // Primary key, content hash
-  title: string
-  artist: string | null
-  bpm: number | null
-  duration: number
-  firstDownbeat: number | null
-  kickZones: KickZone[] | null
-  styleTags: string[] | null
-  plans: Plan[] | null  // Workout variations (JSON)
-  // ... SUNO metadata fields
+  "version": 1,
+  "bars": [0.0, 0.45, 0.92, ...]
 }
 ```
 
-## Audio Analysis
+## Track Directory Structure
 
-Advanced analysis for tracks using madmom, essentia, and pyloudnorm. Extracts:
-- Beat grid with downbeats and bar positions
-- Time-varying tempo curve
-- Kick zones (high bass energy sections)
-- Raw beat times for UI alignment
+When the pipeline writes to `../paincave-tracks/`, each track gets:
 
-### Setup
-
-Requires [uv](https://github.com/astral-sh/uv) and [ffmpeg](https://ffmpeg.org/):
-
-```bash
-# Install uv (macOS)
-brew install uv
-
-# Install ffmpeg (for m4a/mp3 support)
-brew install ffmpeg
 ```
-
-### Running Analysis
-
-```bash
-cd analysis
-
-# Basic analysis
-uv run src/analyze.py ../tracks/{hash}/audio.m4a \
-  --output ../tracks/{hash}/analysis.json
-
-# With custom BPM range (prevents half-time confusion)
-uv run src/analyze.py audio.m4a --min-bpm 120 --max-bpm 150
+{content_hash}/
+  original.wav        # Source audio (input file)
+  audio.m4a           # Streaming-optimized AAC
+  analysis.json       # This contract
+  metadata.md         # Track metadata (title, artist, SUNO info)
+  peaks/
+    overview.json
+    medium.json
+    detail.json
+    tiny.json
 ```
-
-First run creates a virtual environment and installs dependencies (~2-3 min).
-
-### Field Reference
-
-| Field | Description |
-|-------|-------------|
-| `beats` | Every beat with timestamp, bar number, beat position (1-4) |
-| `bpm` | Global BPM of the track |
-| `first_downbeat` | Time of first bar 1, beat 1 |
-| `kick_zones` | Sections with strong kick presence |
-| `raw.beat_times` | Raw beat timestamps for UI snapping |
-| `raw.bass_energy` | Per-beat bass energy values |
-
-## Authoring Workflow
-
-1. Generate songs in SUNO
-2. Blend in Ableton → export as M4A
-3. Create folder: `tracks/{hash}/`
-4. Copy audio as `audio.m4a`
-5. Run analysis:
-   ```bash
-   cd analysis
-   uv run src/analyze.py ../tracks/{hash}/audio.m4a \
-     --output ../tracks/{hash}/analysis.json
-   ```
-6. Generate peaks for waveform visualization
-7. Add track to database via API or migration script
-8. Test in Track Editor
-
-## API Endpoints
-
-### GET /api/tracks
-List all tracks with metadata.
-
-### GET /api/tracks/:hash
-Get single track by content hash.
-
-### PUT /api/tracks/:hash
-Update track metadata (title, artist, styleTags).
-
-### PUT /api/tracks/:hash/plans
-Update plans for a track (Zod-validated).
-
-## Production Migration
-
-1. Create R2 bucket
-2. Upload audio to R2
-3. Deploy Cloudflare Worker (validates via `/api/audio/verify`)
-4. Point `audio.mysterious.cloud` → Worker
-5. Deploy API to fly.io
