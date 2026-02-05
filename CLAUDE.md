@@ -1,6 +1,6 @@
 # Pain Cave Analysis
 
-Audio analysis pipeline for Pain Cave — extracts beat grids, tempo curves, intensity profiles, and structural events from DJ mixes for workout playback.
+Audio analysis pipeline for Pain Cave — extracts beat grids, tempo, work zones from tracks for workout playback.
 
 ## Philosophy
 
@@ -8,58 +8,103 @@ Audio analysis pipeline for Pain Cave — extracts beat grids, tempo curves, int
 - **Brief code.** Fewer lines without sacrificing clarity.
 - **Deterministic.** Same input produces same output.
 - **Offline-first.** Everything runs locally, no cloud dependencies.
-- **Zero warnings, zero errors.** Verify before committing.
-- **Reuse, don't reinvent.** Check existing modules before building new ones.
 
 ## Tech Stack
 
 - **Runtime:** Python 3.11+ via uv
 - **Beat Detection:** madmom (RNN + Dynamic Bayesian Network)
-- **Audio I/O:** SoundFile
+- **Audio I/O:** SoundFile, ffmpeg
 - **Numerics:** NumPy, SciPy
-- **Visualization:** Matplotlib (debugging only)
+- **Validation:** jsonschema
 
 ## Project Structure
 
 ```
-src/           # Source modules (flat layout)
+src/           # Source modules
+bin/           # CLI wrapper (bin/import)
 docs/          # Specs and standards
 ```
+
+## Output Structure
+
+```
+{hash}/
+├── original.wav         # Archive (pristine audio)
+├── audio.m4a            # Streaming format
+├── metadata.json        # Track metadata
+├── analysis.pcav        # Binary: beats + peaks
+├── plan_workzones.json  # Auto-detected work zones
+├── thumb_64.webp        # Thumbnails (added by paincave-thumbnail)
+├── thumb_128.webp
+└── thumb_256.webp
+```
+
+**Key separation:**
+- `analysis.pcav` — objective audio analysis (beats, peaks)
+- `plan_*.json` — workout planning data (can have multiple plans per track)
+- `thumb_*.webp` — visual assets (added separately)
 
 ## How It Works
 
 1. madmom RNN generates beat/downbeat activation functions
 2. Dynamic Bayesian Network decodes beat positions (constrained 4/4)
-3. Tempo curve extracted from beat intervals, smoothed per-bar
-4. Intensity = 50% low-band energy (20-150 Hz) + 50% LUFS loudness
-5. Structural events (build, drop, breakdown) via pattern recognition
-6. Song boundaries via multi-indicator clustering
-7. Output is a single analysis.json per track
+3. Work zones detected from bass energy (20-150 Hz)
+4. Musical key detected via madmom CNN
+5. Beats + peaks written to `analysis.pcav` (binary)
+6. Work zones written to `plan_workzones.json`
+7. M4A converted for streaming
 
 ## Environment Variables
 
-- `PAINCAVE_TRACKS_DIR` — Default tracks directory. CLI args override.
+- `PAINCAVE_TRACKS_DIR` — Default tracks directory. CLI `--library` overrides.
 
-## Conventions
+## CLI Reference
 
-- Flat `src/` layout, no packages or `__init__.py`
-- `analysis.json` is the sole output contract with the main app
-- All CLI commands use argparse
-- Visualization is for debugging, not production
+### bin/import
+
+Import a song into the track library.
+
+```bash
+bin/import track.wav --title "Track Name" --artist "Artist"
+bin/import track.m4a --genres "dark-techno,industrial"
+bin/import track.mp3 --min-bpm 120 --max-bpm 140 --force
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `audio_file` | (required) | Path to audio file |
+| `--library` | `$PAINCAVE_TRACKS_DIR` | Track library directory |
+| `-t, --title` | filename | Track title |
+| `-a, --artist` | "Pain Cave" | Artist name |
+| `--source` | "SUNO" | Audio source platform |
+| `--source-id` | (auto-detect) | ID from source platform |
+| `-g, --genres` | (none) | Comma-separated genre slugs |
+| `--min-bpm` | 100 | Minimum BPM for beat tracking |
+| `--max-bpm` | 180 | Maximum BPM for beat tracking |
+| `-f, --force` | false | Overwrite existing track |
+
+## Source Modules
+
+| File | Purpose |
+|------|---------|
+| `src/import_track.py` | Main entry point — orchestrates pipeline |
+| `src/analyze.py` | Beat detection, tempo, work zones, key |
+| `src/pcav.py` | PCAV binary format read/write |
+| `src/content_hash.py` | Audio content hashing |
 
 ## Standards Documents
 
-- [docs/analysis-output.md](docs/analysis-output.md) — analysis.json schema, field reference
-- [docs/audio-architecture.md](docs/audio-architecture.md) — Two-track audio system, coaching architecture
+- [docs/output-formats.md](docs/output-formats.md) — Complete output format reference
+- [docs/pcav-format.md](docs/pcav-format.md) — PCAV binary format specification
 
-## Running
+## Ecosystem
 
-```bash
-uv run src/analyze.py input.m4a --output analysis.json
-uv run src/analyze.py input.m4a --songs songs.json --output analysis.json
-uv run src/peaks.py input.m4a --output peaks.json
-uv run src/visualize.py analysis.json
-```
+This repo is one step in a multi-project pipeline:
+- **paincave-analysis** — This repo. Analyzes audio, outputs .pcav + JSON
+- **paincave-thumbnail** — Generates AI thumbnails (thumb_*.webp)
+- **paincave/studio** — Extracts assets for deployment, manages track library
+
+Key reference: [`../paincave/shared/schemas/`](../paincave/shared/schemas/) contains JSON schemas.
 
 ## AI Assistant Guidelines
 
@@ -67,17 +112,9 @@ uv run src/visualize.py analysis.json
 - **No slop.** Every generated line must be intentional.
 - **Brief is better.** Fewer lines, same clarity.
 - **Verify with `uv run`** before considering anything done.
-- **No unnecessary abstractions** — this is a CLI tool.
-- `analysis.json` schema is the contract — changes require coordination with the main app.
-- Performance matters — analysis takes 2-3 min for a 30-min mix, don't make it slower.
+- Performance matters — analysis takes 2-3 min for a 30-min mix.
 
 ### Before Committing Code
 1. Zero errors when running
-2. Code is formatted
-3. Feature manually tested with a real audio file
-4. Standards docs reviewed — add, update, or remove as needed
-
-### Communication Style
-- Be direct. Skip preamble.
-- Propose solutions, don't ask permission for obvious fixes.
-- When uncertain, ask one clear question.
+2. Feature manually tested with real audio
+3. Docs updated if needed

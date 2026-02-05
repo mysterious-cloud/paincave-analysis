@@ -91,18 +91,22 @@ def extract_beats(audio_path: Path, min_bpm: int = 100, max_bpm: int = 180) -> t
     return beat_times, beat_positions
 
 
-def detect_key(audio_path: Path) -> str:
+def detect_key(audio_path: Path) -> str | None:
     """Detect musical key using madmom CNN."""
     print("Detecting key...")
 
-    from madmom.features.key import CNNKeyRecognitionProcessor, key_prediction_to_label
+    try:
+        from madmom.features.key import CNNKeyRecognitionProcessor, key_prediction_to_label
 
-    proc = CNNKeyRecognitionProcessor()
-    probs = proc(str(audio_path))
-    key = key_prediction_to_label(probs)
+        proc = CNNKeyRecognitionProcessor()
+        probs = proc(str(audio_path))
+        key = key_prediction_to_label(probs)
 
-    print(f"Key: {key}")
-    return key
+        print(f"Key: {key}")
+        return key
+    except Exception as e:
+        print(f"Warning: Key detection failed: {e}")
+        return None
 
 
 def correct_octave_errors(bpm_curve: np.ndarray, reference_bpm: float, tolerance: float = 0.25) -> np.ndarray:
@@ -239,19 +243,22 @@ def compute_kick_density(
 
     max_bass = np.max(bass_energy) if len(bass_energy) > 0 else 1
 
-    for bar_num, bar_start, bar_end in bar_boundaries:
-        start_idx = int(bar_start)
-        end_idx = int(bar_end)
+    # Interpolate bass energy at sub-second resolution for accurate bar alignment
+    # bass_energy has one value per second; sample it at 10x resolution
+    energy_times = np.arange(len(bass_energy))
+    fine_times = np.linspace(0, len(bass_energy) - 1, len(bass_energy) * 10)
+    fine_energy = np.interp(fine_times, energy_times, bass_energy)
+    fine_rate = 10  # samples per second
 
-        if start_idx < len(bass_energy):
-            end_idx = min(end_idx, len(bass_energy))
-            bar_bass = bass_energy[start_idx:end_idx]
-            if len(bar_bass) > 0:
-                density = float(np.mean(bar_bass)) / max_bass if max_bass > 0 else 0
-            else:
-                density = 0
-        else:
-            density = 0
+    for bar_num, bar_start, bar_end in bar_boundaries:
+        start_idx = int(round(bar_start * fine_rate))
+        end_idx = int(round(bar_end * fine_rate))
+
+        start_idx = max(0, min(start_idx, len(fine_energy) - 1))
+        end_idx = max(start_idx + 1, min(end_idx, len(fine_energy)))
+
+        bar_bass = fine_energy[start_idx:end_idx]
+        density = float(np.mean(bar_bass)) / max_bass if max_bass > 0 else 0
 
         density_per_bar.append(density)
         bar_info.append({
@@ -287,13 +294,14 @@ def detect_kick_zones(
         if zone_type != current_zone_type:
             zone_length = i - current_zone_start
             if zone_length >= min_zone_bars:
+                start_sec = bar_info[current_zone_start]["start_t"]
+                end_sec = bar_info[i]["start_t"]
                 zones.append({
                     "type": current_zone_type,
                     "startBar": current_zone_start + 1,
-                    "endBar": i,
-                    "startSec": bar_info[current_zone_start]["start_t"],
-                    "endSec": bar_info[i]["start_t"],  # Use start of next bar (measure boundary)
-                    "avgDensity": round(float(np.mean(kick_density[current_zone_start:i])), 2)
+                    "durationBars": zone_length,
+                    "startSeconds": round(start_sec, 2),
+                    "durationSeconds": round(end_sec - start_sec, 2),
                 })
 
             current_zone_start = i
@@ -309,17 +317,17 @@ def detect_kick_zones(
             last_bar = bar_info[-1]
             bar_duration = last_bar["end_t"] - last_bar["start_t"]
             final_end_t = last_bar["start_t"] + bar_duration * 4 / 3  # Extend beat 4 to next beat 1
+        start_sec = bar_info[current_zone_start]["start_t"]
         zones.append({
             "type": current_zone_type,
             "startBar": current_zone_start + 1,
-            "endBar": len(kick_density),
-            "startSec": bar_info[current_zone_start]["start_t"],
-            "endSec": round(final_end_t, 3),
-            "avgDensity": round(float(np.mean(kick_density[current_zone_start:])), 2)
+            "durationBars": zone_length,
+            "startSeconds": round(start_sec, 2),
+            "durationSeconds": round(final_end_t - start_sec, 2),
         })
 
-    # Only return work zones (not breakdowns)
-    work_zones = [z for z in zones if z["type"] == "work"]
+    # Only return work zones (not breakdowns), strip type field
+    work_zones = [{k: v for k, v in z.items() if k != "type"} for z in zones if z["type"] == "work"]
     print(f"Detected {len(work_zones)} work zones (filtered from {len(zones)} total)")
     return work_zones
 
@@ -473,7 +481,7 @@ def build_beats_array(
                 beats.append({
                     "t": round(float(time), 3),
                     "bar": 0,
-                    "beat": int(4 + (i - first_downbeat_idx + 1)),
+                    "beat": int(pickup_beat),
                     "confidence": round(float(conf), 2)
                 })
             else:

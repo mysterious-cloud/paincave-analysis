@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec uv run "$(dirname "$0")/../src/import_track.py" "$@"
