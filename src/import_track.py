@@ -29,7 +29,7 @@ from analyze import analyze_audio, load_audio
 from content_hash import compute_content_hash
 from pcav import (
     PCAVData, AnalysisSection, BeatsSection,
-    write_pcav_file, peaks_from_samples,
+    write_pcav_file, build_peak_mipmaps,
 )
 
 
@@ -169,6 +169,7 @@ def import_song(
     print("Writing analysis.pcav...")
     samples, sample_rate = load_audio(original_wav)
     beat_times = analysis.get("raw", {}).get("beatTimes", [])
+    levels = build_peak_mipmaps(samples, sample_rate)
 
     pcav_data = PCAVData(
         analysis=AnalysisSection(
@@ -177,10 +178,11 @@ def import_song(
             key=analysis.get("key"),
         ),
         beats=BeatsSection(beat_times=beat_times),
-        peaks=peaks_from_samples(samples, sample_rate, peaks_per_second=10),
+        peaks=levels[0],
+        overview_peaks=levels[1],
     )
     write_pcav_file(song_dir / "analysis.pcav", pcav_data)
-    print(f"  {len(beat_times)} beats, {len(pcav_data.peaks.peaks)} peaks")
+    print(f"  {len(beat_times)} beats, editor={len(levels[0].peaks)} overview={len(levels[1].peaks)} peaks")
 
     # Step 6: Write plan_workzones.json
     print("Writing plan_workzones.json...")

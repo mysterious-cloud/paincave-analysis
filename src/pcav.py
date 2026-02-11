@@ -14,13 +14,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+import numpy as np
+from scipy import signal
+
 # Section type constants
 SECTION_ANALYSIS = 0x01
 SECTION_BEATS = 0x02
-SECTION_PEAKS = 0x03
+SECTION_PEAKS = 0x03           # Editor peaks (window=256, ~187.5 peaks/s at 48kHz)
+SECTION_PEAKS_OVERVIEW = 0x08  # Overview peaks (window=8192, ~5.86/s)
 SECTION_THUMB_64 = 0x10
 SECTION_THUMB_128 = 0x11
 SECTION_THUMB_256 = 0x12
+
+# Peak window sizes (samples per peak at 48kHz)
+MIPMAP_WINDOWS = [256, 8192]
 
 PCAV_MAGIC = b"PCAV"
 PCAV_VERSION = 1
@@ -66,7 +73,7 @@ class BeatsSection:
 
 @dataclass
 class PeaksSection:
-    """Waveform peaks at 10 peaks/second."""
+    """Waveform peaks (default 50 peaks/second)."""
     peaks: list[tuple[int, int]]  # (min, max) as int8 pairs
 
 
@@ -83,6 +90,7 @@ class PCAVData:
     analysis: AnalysisSection | None = None
     beats: BeatsSection | None = None
     peaks: PeaksSection | None = None
+    overview_peaks: PeaksSection | None = None  # Coarse overview (section 0x08)
     thumb_64: ThumbnailSection | None = None
     thumb_128: ThumbnailSection | None = None
     thumb_256: ThumbnailSection | None = None
@@ -145,9 +153,9 @@ def decode_beats(data: bytes) -> BeatsSection:
 
 
 def encode_peaks(section: PeaksSection) -> bytes:
-    """Encode PEAKS section as int8 min/max pairs."""
+    """Encode PEAKS section as uint32 count + int8 min/max pairs."""
     peak_count = len(section.peaks)
-    data = struct.pack("<H", peak_count)
+    data = struct.pack("<I", peak_count)
 
     for min_val, max_val in section.peaks:
         # Clamp to int8 range
@@ -159,12 +167,19 @@ def encode_peaks(section: PeaksSection) -> bytes:
 
 
 def decode_peaks(data: bytes) -> PeaksSection:
-    """Decode PEAKS section."""
-    peak_count = struct.unpack("<H", data[:2])[0]
-    peaks = []
+    """Decode PEAKS section. Auto-detects uint16 (old) vs uint32 (new) header."""
+    # Try uint16 first: if 2 + count * 2 == len(data), it's old format
+    count16 = struct.unpack("<H", data[:2])[0]
+    if 2 + count16 * 2 == len(data):
+        peak_count = count16
+        data_start = 2
+    else:
+        peak_count = struct.unpack("<I", data[:4])[0]
+        data_start = 4
 
+    peaks = []
     for i in range(peak_count):
-        offset = 2 + i * 2
+        offset = data_start + i * 2
         min_val, max_val = struct.unpack("bb", data[offset:offset + 2])
         peaks.append((min_val, max_val))
 
@@ -193,6 +208,8 @@ def build_pcav_payload(pcav: PCAVData) -> bytes:
         sections.append((SECTION_BEATS, encode_beats(pcav.beats)))
     if pcav.peaks:
         sections.append((SECTION_PEAKS, encode_peaks(pcav.peaks)))
+    if pcav.overview_peaks:
+        sections.append((SECTION_PEAKS_OVERVIEW, encode_peaks(pcav.overview_peaks)))
     if pcav.thumb_64:
         sections.append((SECTION_THUMB_64, encode_thumbnail(pcav.thumb_64)))
     if pcav.thumb_128:
@@ -250,6 +267,8 @@ def parse_pcav_payload(payload: bytes) -> PCAVData:
             pcav.beats = decode_beats(section_data)
         elif section_type == SECTION_PEAKS:
             pcav.peaks = decode_peaks(section_data)
+        elif section_type == SECTION_PEAKS_OVERVIEW:
+            pcav.overview_peaks = decode_peaks(section_data)
         elif section_type == SECTION_THUMB_64:
             pcav.thumb_64 = decode_thumbnail(section_data, 64)
         elif section_type == SECTION_THUMB_128:
@@ -395,6 +414,63 @@ def _rewrite_wav_without_chunk(f: BinaryIO, chunks: list, exclude_id: str) -> No
 
 # --- High-level Helpers ---
 
+def lowpass_filter(samples: np.ndarray, sample_rate: int, cutoff_hz: int = 300) -> np.ndarray:
+    """Low-pass filter audio to isolate bass/kick energy for waveform display."""
+    nyquist = sample_rate / 2
+    normalized_cutoff = min(cutoff_hz / nyquist, 0.99)
+    sos = signal.butter(4, normalized_cutoff, btype='low', output='sos')
+    return signal.sosfiltfilt(sos, samples).astype(np.float64)
+
+
+def build_peak_mipmaps(samples, sample_rate: int, filter_hz: int = 300) -> list[PeaksSection]:
+    """Generate peak levels from audio samples: editor (window=256) and overview (window=8192).
+
+    When filter_hz is set (default 300Hz), applies a low-pass filter before computing
+    peaks so the waveform shape shows kicks/bass energy rather than high-frequency noise.
+
+    Returns [editor_peaks, overview_peaks].
+    """
+    samples = np.asarray(samples)
+    if filter_hz:
+        samples = lowpass_filter(samples, sample_rate, filter_hz)
+
+    levels: list[PeaksSection] = []
+
+    for window in MIPMAP_WINDOWS:
+        num_peaks = len(samples) // window
+        if num_peaks == 0:
+            levels.append(PeaksSection(peaks=[]))
+            continue
+
+        truncated = samples[:num_peaks * window]
+        windows = truncated.reshape(num_peaks, window)
+        mins = np.min(windows, axis=1)
+        maxs = np.max(windows, axis=1)
+
+        peaks = [
+            (int(round(mn * 127)), int(round(mx * 127)))
+            for mn, mx in zip(mins, maxs)
+        ]
+        levels.append(PeaksSection(peaks=peaks))
+
+    return levels
+
+
+def has_stale_peak_sections(pcav_path: Path) -> bool:
+    """Check if PCAV file contains intermediate peak sections (0x04-0x07) that should be removed."""
+    data = pcav_path.read_bytes()[:200]
+    if len(data) < 6 or data[:4] != PCAV_MAGIC:
+        return False
+    section_count = data[5]
+    for i in range(section_count):
+        offset = 6 + i * 9
+        if offset + 9 > len(data):
+            break
+        if 0x04 <= data[offset] <= 0x07:
+            return True
+    return False
+
+
 def peaks_from_samples(samples, sample_rate: int, peaks_per_second: int = 10) -> PeaksSection:
     """Generate PCAV peaks from audio samples.
 
@@ -406,8 +482,6 @@ def peaks_from_samples(samples, sample_rate: int, peaks_per_second: int = 10) ->
     Returns:
         PeaksSection with int8 min/max pairs
     """
-    import numpy as np
-
     samples = np.asarray(samples)
     samples_per_peak = sample_rate // peaks_per_second
     num_peaks = len(samples) // samples_per_peak

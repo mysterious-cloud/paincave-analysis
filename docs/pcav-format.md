@@ -32,11 +32,14 @@ Offset  Size  Field
 
 ## Section Types
 
-| Type | Name     | Description                    |
-|------|----------|--------------------------------|
-| 0x01 | ANALYSIS | Track metadata (bpm, key, duration) |
-| 0x02 | BEATS    | Beat timing data               |
-| 0x03 | PEAKS    | Waveform peaks (10 peaks/sec)  |
+| Type | Name           | Description                              |
+|------|----------------|------------------------------------------|
+| 0x01 | ANALYSIS       | Track metadata (bpm, key, duration)       |
+| 0x02 | BEATS          | Beat timing data                          |
+| 0x03 | PEAKS          | Editor peaks (window=256, ~187.5/s at 48kHz) |
+| 0x08 | PEAKS_OVERVIEW | Overview peaks (window=8192, ~5.86/s)     |
+
+Types 0x04-0x07 were previously used for intermediate mipmap levels but are now deprecated. Readers should silently ignore unknown section types.
 
 All sections are optional. Readers should check the directory and handle missing sections gracefully.
 
@@ -97,29 +100,49 @@ for interval_cs in intervals:
 - Supports tempos down to ~23 BPM (2550ms between beats)
 - For N beats, there are N-1 intervals
 
-### 0x03 PEAKS
+### 0x03 PEAKS / 0x08 PEAKS_OVERVIEW
 
-Waveform peak data at 10 peaks per second.
+Waveform peak data at two resolutions. Both share the same encoding:
 
 ```
 Offset  Size   Field
 ------  -----  -----
-0       2      Peak count (uint16)
-2       N×2    Peak data: [min: int8, max: int8][]
+0       4      Peak count (uint32)
+4       N×2    Peak data: [min: int8, max: int8][]
 ```
 
 **Notes:**
 - Values are signed bytes, -128 to +127, representing -1.0 to +1.0
-- Peak count = duration_seconds × 10
 - To convert: `float_value = int8_value / 127.0`
+- Legacy files may use uint16 peak count header (auto-detected by readers)
+
+**Resolutions (at 48kHz sample rate):**
+
+| Section | Window | Peaks/sec | Use case                     |
+|---------|--------|-----------|------------------------------|
+| 0x03    | 256    | 187.5     | Editor waveform rendering    |
+| 0x08    | 8192   | 5.86      | Track list thumbnails        |
+
+The editor uses range aggregation on the high-resolution peaks (0x03), so it renders correctly at all zoom levels from a single peak set. The overview section (0x08) is used by track list thumbnails via HTTP range requests (~2KB fetch instead of the full file).
 
 ## Size Estimates
 
-| Track Length | Beats  | Analysis | Beats  | Peaks  | Total  |
-|--------------|--------|----------|--------|--------|--------|
-| 3 min        | ~360   | 6 B      | 364 B  | 3.6 KB | ~4 KB  |
-| 10 min       | ~1,200 | 6 B      | 1.2 KB | 12 KB  | ~13 KB |
-| 30 min       | ~3,600 | 6 B      | 3.6 KB | 36 KB  | ~40 KB |
+**Total file size (editor + overview peaks):**
+
+| Track Length | Analysis + Beats | Peaks (2 levels) | Total   |
+|--------------|------------------|-------------------|---------|
+| 3 min        | ~370 B           | ~62 KB            | ~63 KB  |
+| 10 min       | ~1.2 KB          | ~206 KB           | ~207 KB |
+| 30 min       | ~3.6 KB          | ~618 KB           | ~622 KB |
+
+**Range request sizes:**
+
+| Section  | 3 min track | 30 min track |
+|----------|-------------|--------------|
+| Editor   | ~60 KB      | ~600 KB      |
+| Overview | ~2 KB       | ~19 KB       |
+
+Track list thumbnails only fetch the header (~100 bytes) + overview section (~2KB).
 
 ## Reading Example (Python)
 
@@ -149,3 +172,5 @@ const peaks = await fetch(url, { headers: { Range: peaksRange } });
 ## Version History
 
 - **1.0** - Initial specification
+- **1.0** - Added mipmap peak sections 0x04-0x08 (backward compatible)
+- **1.0** - Simplified to 2 peak levels: editor (0x03) + overview (0x08). Deprecated 0x04-0x07.

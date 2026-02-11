@@ -1,2 +1,6 @@
 #!/usr/bin/env bash
-exec uv run "$(dirname "$0")/../src/import_track.py" "$@"
+# Pain Cave Analysis — track import CLI wrapper
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" python "$PROJECT_DIR/src/import_track.py" "$@"
