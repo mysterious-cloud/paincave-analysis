@@ -434,6 +434,11 @@ def build_peak_mipmaps(samples, sample_rate: int, filter_hz: int = 300) -> list[
     if filter_hz:
         samples = lowpass_filter(samples, sample_rate, filter_hz)
 
+    # Normalize to [-1, 1] so int8 peaks use full range
+    peak_amp = np.max(np.abs(samples))
+    if peak_amp > 0:
+        samples = samples / peak_amp
+
     levels: list[PeaksSection] = []
 
     for window in MIPMAP_WINDOWS:
