@@ -1,216 +1,92 @@
 # Output Formats
 
-This document describes all output files produced by `bin/import`.
+What `src/import_track.py` (via `bin/import` or `../paincave/bin/analyze.sh`) writes. Verified against the source; if they disagree, the source wins.
 
-## Output Structure
+> **WARNING — `--force` deletes the whole track directory.**
+> If `{library}/{hash}/` already exists, `--force` runs `shutil.rmtree` on it before re-importing. Everything in that directory is lost, including files this repo did not create: `thumb*.webp` (paincave-thumbnail) and `plans/`. Back up or regenerate them afterwards.
+
+## Track directory
 
 ```
-{hash}/
-├── original.wav         # Archive audio (pristine)
-├── audio.m4a            # Streaming audio (AAC 256kbps)
-├── metadata.json        # Track metadata
-├── analysis.pcav        # Binary analysis data (beats + peaks)
-├── plan_workzones.json  # Auto-detected work zones
-├── thumb_64.webp        # Thumbnail 64×64 (added by paincave-thumbnail)
-├── thumb_128.webp       # Thumbnail 128×128 (added by paincave-thumbnail)
-└── thumb_256.webp       # Thumbnail 256×256 (added by paincave-thumbnail)
+{library}/{hash}/
+├── original.wav          # written here
+├── analysis.pcav         # written here
+├── plan_workzones.json   # written here
+├── metadata.json         # written here
+├── audio.m4a             # written here
+├── thumb*.webp           # NOT written here — paincave-thumbnail
+└── plans/                # NOT written here — Studio-era leftover
 ```
 
-The `{hash}` directory name is a 12-character content hash derived from the audio samples.
+- `{library}` = `--library`, else `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks` relative to this repo. The repo's scripts do not load a `.env` file; set the variable in the shell or pass `--library`.
+- `{hash}` = 12-char content hash of the input file (see [Content hash](#content-hash)).
+- Files are written in the order listed above. A failure part-way leaves a partial directory, and re-running without `--force` prints "Track already exists" and exits 0.
+- The paincave app database is the source of truth for plans and metadata edits. These files are the import output, not a live record.
 
----
+## original.wav
 
-## metadata.json
+- `.wav` input: byte copy (`shutil.copy2`); sample rate, bit depth and channels are unchanged.
+- Any other input: `ffmpeg -i <input> -ar 44100` (ffmpeg's default WAV encoding, channel count preserved).
 
-Track metadata in JSON format.
+Beat, key, peak and work-zone analysis read `original.wav`. The hash and the SUNO comment tags come from the input file.
 
-```json
-{
-  "hash": "98f755fef882",
-  "title": "The Strength Within",
-  "artist": "Pain Cave",
-  "source": "SUNO",
-  "sourceId": "23ebb5df-8fe3-4d50-8abb-e4a29ffabb53",
-  "genres": ["motivational", "epic"],
-  "bpm": 120.0,
-  "durationSeconds": 192,
-  "key": "Ab major",
-  "createdAt": "2026-01-22T20:49:50Z",
-  "updatedAt": "2026-02-05T16:10:51Z"
-}
-```
+## audio.m4a
 
-### Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `hash` | string | 12-char content hash (directory name) |
-| `title` | string | Track title |
-| `artist` | string | Artist name |
-| `source` | string | Source platform (e.g., "SUNO") |
-| `sourceId` | string | ID from source platform |
-| `genres` | string[] | Genre slugs |
-| `bpm` | number | Beats per minute |
-| `durationSeconds` | integer | Track duration in seconds |
-| `key` | string \| null | Musical key (e.g., "Ab major", "E minor") |
-| `createdAt` | string | ISO 8601 creation timestamp |
-| `updatedAt` | string | ISO 8601 last update timestamp |
-
-### Notes
-
-- `createdAt` uses the source platform's creation time if available, otherwise file modification time
-- `key` uses flat notation from analysis but can be either sharps or flats
-- Schema: `../paincave/shared/schemas/metadata.schema.json`
-
----
+`ffmpeg -i original.wav -c:a aac -b:a 256k`.
 
 ## analysis.pcav
 
-Binary file containing beats and waveform peaks. See [pcav-format.md](pcav-format.md) for full specification.
-
-### Quick Reference
-
-| Section | Content | Size (3 min track) |
-|---------|---------|-------------------|
-| ANALYSIS | duration, BPM, key | 6 bytes |
-| BEATS | beat times (delta-encoded) | ~360 bytes |
-| PEAKS | waveform min/max at 10/sec | ~3.6 KB |
-
-### Reading in Python
-
-```python
-from pcav import read_pcav_file
-
-pcav = read_pcav_file("analysis.pcav")
-
-print(f"BPM: {pcav.analysis.bpm}")
-print(f"Key: {pcav.analysis.key}")
-print(f"Duration: {pcav.analysis.duration_seconds}s")
-
-# Beat times in seconds
-for t in pcav.beats.beat_times[:10]:
-    print(f"Beat at {t:.2f}s")
-
-# Peaks as (min, max) int8 pairs
-for min_val, max_val in pcav.peaks.peaks[:10]:
-    print(f"Peak: {min_val} to {max_val}")
-```
-
-### Reading in TypeScript
-
-```typescript
-// Fetch and parse
-const buffer = await fetch("analysis.pcav").then(r => r.arrayBuffer());
-const view = new DataView(buffer);
-
-// Verify magic "PCAV"
-const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 4));
-if (magic !== "PCAV") throw new Error("Invalid PCAV file");
-
-const version = view.getUint8(4);
-const sectionCount = view.getUint8(5);
-
-// Parse section directory (9 bytes each, starting at offset 6)
-for (let i = 0; i < sectionCount; i++) {
-  const dirOffset = 6 + i * 9;
-  const type = view.getUint8(dirOffset);
-  const dataOffset = view.getUint32(dirOffset + 1, true);
-  const dataLength = view.getUint32(dirOffset + 5, true);
-
-  // Read section data from dataOffset
-}
-```
-
----
+Binary: ANALYSIS (duration, BPM, key), BEATS (madmom beat times), editor peaks (0x03) and overview peaks (0x08). Peaks are computed from 300 Hz low-pass filtered audio, normalized to full scale. Full spec: [pcav-format.md](pcav-format.md).
 
 ## plan_workzones.json
-
-Auto-detected work zones (high-energy sections) for workout planning.
 
 ```json
 {
   "version": 1,
   "zones": [
-    {
-      "startBar": 20,
-      "durationBars": 7,
-      "startSeconds": 40.01,
-      "durationSeconds": 13.99
-    },
-    {
-      "startBar": 28,
-      "durationBars": 7,
-      "startSeconds": 56.0,
-      "durationSeconds": 13.99
-    }
+    { "startBar": 21, "durationBars": 23, "startSeconds": 28.73, "durationSeconds": 32.66 }
   ]
 }
 ```
 
-### Fields
+| Field | Type | Meaning |
+|-------|------|---------|
+| `startBar` | integer | 1-indexed bar where the zone starts |
+| `durationBars` | integer | Zone length in bars (minimum 4) |
+| `startSeconds` | number | Start time, 2 decimals |
+| `durationSeconds` | number | Length, 2 decimals; a zone reaching the final bar runs to track end |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `version` | integer | Format version (currently 1) |
-| `zones` | array | List of work zones |
+Zones are runs of bars whose mean 20–150 Hz energy, normalized to the track maximum, is ≥ 0.45. Only "work" runs are kept; breakdowns are dropped. The `plan_` prefix is historical. The file is not a plan.
 
-### Zone Fields
+## metadata.json
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `startBar` | integer | Starting bar number (1-indexed) |
-| `durationBars` | integer | Duration in bars |
-| `startSeconds` | number | Start time in seconds |
-| `durationSeconds` | number | Duration in seconds |
+Validated against `../paincave/shared/schemas/metadata.schema.json` (`additionalProperties: false`). A validation failure only prints `WARNING: metadata validation failed` and the file is still written. A missing schema file raises and aborts the import after `plan_workzones.json` has been written.
 
-### Notes
+| Field | Type | Value written |
+|-------|------|---------------|
+| `hash` | string `^[a-f0-9]{12}$` | Content hash (= directory name) |
+| `title` | string, min 1 | `--title`, else input filename stem |
+| `artist` | string | `--artist`, else `"Pain Cave"` |
+| `source` | `"SUNO"` | `--source` (only allowed value) |
+| `sourceId` | string | `--source-id`, else SUNO `id=` from the ffprobe `comment` tag, else `""` |
+| `genres` | string[] | `--genres` split on commas, else `[]` |
+| `bpm` | number | Median of octave-corrected local tempo from beat intervals, 1 decimal |
+| `durationSeconds` | integer | Rounded track duration |
+| `key` | string \| null | madmom label (e.g. `"D# minor"`, `"Bb major"`), `null` if detection fails |
+| `createdAt` | date-time | SUNO `created=` from the comment tag, else input file mtime (UTC) |
+| `updatedAt` | date-time | Import time (UTC) |
 
-- Work zones are detected from bass energy (20-150 Hz kick density)
-- Minimum zone length is 4 bars
-- These are suggestions for workout intervals, not definitive boundaries
-- The `plan_` prefix indicates this is planning data (future: multiple plans per track)
+## Content hash
 
----
+Implemented in `src/content_hash.py`, computed from the **input file** (not `original.wav`):
 
-## Audio Files
+1. Decode to samples:
+   - `.m4a`, `.mp3`, `.aac`: `ffmpeg -ar 44100 -ac 1` to a temp WAV, then read with soundfile.
+   - Anything else (e.g. `.wav`): read directly with soundfile at its native sample rate.
+2. Downmix to mono with `np.mean` across channels (if still multichannel).
+3. Cast to float32 and MD5 the raw bytes.
+4. Keep the first 12 hex chars.
 
-### original.wav
+**It does not give the same hash across formats.** The same master as a 48 kHz WAV, a 44.1 kHz WAV and an M4A produces three different hashes. So does re-importing an `original.wav` that was converted from a non-WAV input.
 
-- Pristine archive copy
-- 44.1 kHz sample rate
-- 16-bit PCM
-- Not modified after import
-
-### audio.m4a
-
-- Streaming format
-- AAC codec at 256 kbps
-- Suitable for web/mobile playback
-
----
-
-## Thumbnails (External)
-
-Added by `paincave-thumbnail`, not by this pipeline.
-
-| File | Size | Format |
-|------|------|--------|
-| `thumb_64.webp` | 64×64 px | WebP |
-| `thumb_128.webp` | 128×128 px | WebP |
-| `thumb_256.webp` | 256×256 px | WebP |
-
----
-
-## Content Hash
-
-The directory name is a 12-character hash derived from raw audio samples:
-
-1. Decode audio to mono PCM
-2. Convert to float32
-3. Compute MD5
-4. Truncate to 12 characters
-
-This ensures:
-- Same audio content → same hash (regardless of format/metadata)
-- Different audio → different hash
-- Filesystem-friendly names
+**The paincave server hashes differently.** `../paincave/server/src/services/audioService.ts` (`computeContentHash`) takes MD5 over `ffmpeg -f s16le -ac 1 -ar 22050` output. For the same file it will not match the hash computed here.

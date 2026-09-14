@@ -171,6 +171,7 @@ const peaks = await fetch(url, { headers: { Range: peaksRange } });
 
 ## Version History
 
-- **1.0** - Initial specification
-- **1.0** - Added mipmap peak sections 0x04-0x08 (backward compatible)
-- **1.0** - Simplified to 2 peak levels: editor (0x03) + overview (0x08). Deprecated 0x04-0x07.
+The header version byte has only ever been `1` (`PCAV_VERSION` in `src/pcav.py`). The layout change below shipped without a bump; readers handle both via auto-detection.
+
+- **2026-02-05** (`d51fe6e`) — Initial specification: ANALYSIS, BEATS, PEAKS (10 peaks/s, uint16 count).
+- **2026-02-11** (`6370f8a`) — PEAKS count widened to uint32; two peak levels, editor (0x03) + overview (0x08); 0x04-0x07 deprecated.
