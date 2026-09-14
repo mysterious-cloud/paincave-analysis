@@ -1,60 +1,27 @@
 # PCAV Format Specification
 
-Version 1.0
+**Writer version: 2 (2026-09-14). Readers accept versions 1 and 2.** All integers and floats are little-endian. New writes use v2; existing assets are never silently rewritten.
 
-## Overview
+## Container
 
-PCAV (Pain Cave Audio) is a compact binary format for storing audio analysis data: beat timing, waveform peaks, and track metadata.
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 4 | ASCII `PCAV` |
+| 4 | 1 | Version: 1 or 2 |
+| 5 | 1 | Number of directory entries |
+| 6 | 9 × count | Directory |
 
-**File:** `analysis.pcav` in each track directory.
+Each directory entry is `type:uint8, offset:uint32, length:uint32`. Offsets are relative to the file start. Sections must lie after the complete directory, fit within the file, not overlap, and have unique types. Unknown section types are skipped after these checks. At most 255 sections; each section is limited to 16 MiB. Counts must match section lengths exactly before allocation: at most 100,000 beats and 2,000,000 peaks per level.
 
-## Structure
+All sections remain optional. v2 timestamps must be strictly increasing, finite, nonnegative and earlier than exact duration when ANALYSIS is present. Invalid/truncated input raises an error, never a partial grid.
 
-```
-Offset  Size     Field
-------  -------  -----
-0       4        Magic "PCAV" (validation)
-4       1        Version (currently 1)
-5       1        Section count (N)
-6       9×N      Section directory
-6+9N    ...      Section data (concatenated)
-```
+## Version 2 sections
 
-### Section Directory Entry (9 bytes each)
+### 0x01 ANALYSIS — 12 bytes
 
-```
-Offset  Size  Field
-------  ----  -----
-0       1     Section type
-1       4     Data offset (from start of file)
-5       4     Data length (bytes)
-```
+`durationSeconds:float64, bpmTimes10:uint16, key:uint8, reserved:uint8`
 
-## Section Types
-
-| Type | Name           | Description                              |
-|------|----------------|------------------------------------------|
-| 0x01 | ANALYSIS       | Track metadata (bpm, key, duration)       |
-| 0x02 | BEATS          | Beat timing data                          |
-| 0x03 | PEAKS          | Editor peaks (window=256, ~187.5/s at 48kHz) |
-| 0x08 | PEAKS_OVERVIEW | Overview peaks (window=8192, ~5.86/s)     |
-
-Types 0x04-0x07 were previously used for intermediate mipmap levels but are now deprecated. Readers should silently ignore unknown section types.
-
-All sections are optional. Readers should check the directory and handle missing sections gracefully.
-
-## Section Formats
-
-### 0x01 ANALYSIS (6 bytes)
-
-```
-Offset  Size  Field
-------  ----  -----
-0       2     Duration in seconds (uint16)
-2       2     BPM × 10 (uint16, e.g., 1280 = 128.0 BPM)
-4       1     Key (see encoding table)
-5       1     Reserved (0x00)
-```
+Duration is measured frames / sample rate, without whole-second rounding. BPM 0 means unknown (for example silence or insufficient beats). Reserved byte is zero. Duration must be positive and finite.
 
 **Key Encoding:**
 
@@ -76,102 +43,39 @@ Offset  Size  Field
 
 Flat keys map to their sharp equivalents (e.g., Ab = G#).
 
-### 0x02 BEATS
+### 0x02 BEATS — 12 + 8 × count bytes
 
-Beat timing stored as first beat position + intervals between consecutive beats.
+`count:uint32, firstDownbeatIndex:int32, beatsPerBar:uint8, reserved:3 bytes, absoluteMicroseconds:uint64[count]`
 
-```
-Offset  Size   Field
-------  -----  -----
-0       2      First beat time in milliseconds (uint16)
-2       2      Beat count (uint16)
-4       N      Beat intervals in centiseconds (uint8[])
-```
+The downbeat index identifies **bar 1, beat 1**; -1 means unknown. Meter is 1–32 beats/bar; the current analyzer emits 4. Values must be below 2^53 microseconds for exact JavaScript integer representation. Quantize each absolute timestamp independently; maximum error is 0.5 microseconds, with no accumulated delta drift. Do not clamp long intro/gap values.
 
-**Reconstructing beat times:**
-```python
-beats = [first_beat_ms / 1000.0]
-for interval_cs in intervals:
-    beats.append(beats[-1] + interval_cs / 100.0)
-```
+Before the selected first downbeat, beats use bar 0 and beat `((index - firstDownbeatIndex) mod meter) + 1`, with nonnegative modulo. From the downbeat onward, bars start at 1. Multiple pickup bars still use bar 0; their beat labels remain within 1–meter.
 
-**Notes:**
-- Intervals are centiseconds (10ms units), uint8 range 0-255 = 0-2550ms
-- Supports tempos down to ~23 BPM (2550ms between beats)
-- For N beats, there are N-1 intervals
+### 0x03 PEAKS / 0x08 PEAKS_OVERVIEW — 12 + 2 × count bytes
 
-### 0x03 PEAKS / 0x08 PEAKS_OVERVIEW
+`count:uint32, sampleRate:uint32, windowSamples:uint32, [min:int8, max:int8][count]`
 
-Waveform peak data at two resolutions. Both share the same encoding:
+Sample rate is 1–768,000 Hz; window size is 1–2^24 samples. Rate is **sampleRate / windowSamples**, not a fixed 48 kHz assumption. Current windows: 256 (editor), 8192 (overview). Peaks include the final partial window. Last-window display coverage can exceed exact media duration by less than one window; playback uses exact duration.
 
-```
-Offset  Size   Field
-------  -----  -----
-0       4      Peak count (uint32)
-4       N×2    Peak data: [min: int8, max: int8][]
-```
+The writer uses mono samples, a 300 Hz low-pass display filter and amplitude normalization for visualization only. Audio is not normalized. Values must satisfy -128 ≤ min ≤ max ≤ 127; readers divide by 127 and clamp -128 to -1.
 
-**Notes:**
-- Values are signed bytes, -128 to +127, representing -1.0 to +1.0
-- To convert: `float_value = int8_value / 127.0`
-- Legacy files may use uint16 peak count header (auto-detected by readers)
+## Legacy version 1
 
-**Resolutions (at 48kHz sample rate):**
+- ANALYSIS: `<HHBx>`: whole-second uint16 duration, BPM × 10, key, reserved.
+- BEATS: `<HH>` first beat milliseconds and count, then exactly max(0, count-1) uint8 centisecond intervals. It contains **no downbeat phase**. Readers accumulate integer milliseconds to avoid additional floating-point summation error; information already lost by old delta quantization cannot be recovered.
+- PEAKS: uint32 count plus int8 pairs, with implicit 48 kHz / 256 or 8192 samples. The older uint16-count editor section was 10 peaks/s and is recognized only when its exact length matches. Non-48 kHz legacy files cannot recover their real timebase from PCAV alone; reanalysis is required.
+- The main client may recover phase from `plan_workzones.json` only when every machine zone start matches a unique raw beat within 6 ms and implies the same downbeat index. Otherwise phase is unknown (`grid.phaseSource: 'unknown'`) and no numbered beats are returned. A non-OK, non-JSON `Content-Type` or unparseable sidecar counts as no anchors, so a server must send it as JSON. The main app's editor and ride do not surface unknown phase yet. This recovers the shipped Unbreakable grid without editing catalog assets.
 
-| Section | Window | Peaks/sec | Use case                     |
-|---------|--------|-----------|------------------------------|
-| 0x03    | 256    | 187.5     | Editor waveform rendering    |
-| 0x08    | 8192   | 5.86      | Track list thumbnails        |
+## Partial reads
 
-The editor uses range aggregation on the high-resolution peaks (0x03), so it renders correctly at all zoom levels from a single peak set. The overview section (0x08) is used by track list thumbnails via HTTP range requests (~2KB fetch instead of the full file).
+Fetch bytes 0–5, then exactly bytes 0 through `6 + 9 × sectionCount - 1`. Fetch the chosen peak section using its offset and length; pass the container version to the section decoder. Verify 206 Content-Range and exact body length. A 200 response is a whole-file fallback. Reading a fixed 200-byte header can overrun a valid short file.
 
-## Size Estimates
+## Verification
 
-**Total file size (editor + overview peaks):**
+`uv run pytest -q` (equivalently `uv run python -m unittest discover -s tests`) exercises Python validation and deterministic import failures. `uv run python tests/export_pcav_fixtures.py ../paincave/tests/fixtures/pcav` generates shared fixtures; `bun test tests/pcav.test.ts` in paincave reads them. Keep the stripped shipped Unbreakable fixture alongside generated fixtures; it is historical regression evidence, not generated synthetic data.
 
-| Track Length | Analysis + Beats | Peaks (2 levels) | Total   |
-|--------------|------------------|-------------------|---------|
-| 3 min        | ~370 B           | ~62 KB            | ~63 KB  |
-| 10 min       | ~1.2 KB          | ~206 KB           | ~207 KB |
-| 30 min       | ~3.6 KB          | ~618 KB           | ~622 KB |
+## History
 
-**Range request sizes:**
-
-| Section  | 3 min track | 30 min track |
-|----------|-------------|--------------|
-| Editor   | ~60 KB      | ~600 KB      |
-| Overview | ~2 KB       | ~19 KB       |
-
-Track list thumbnails only fetch the header (~100 bytes) + overview section (~2KB).
-
-## Reading Example (Python)
-
-```python
-from pcav import read_pcav_file
-from pathlib import Path
-
-pcav = read_pcav_file(Path("analysis.pcav"))
-
-print(f"BPM: {pcav.analysis.bpm}")
-print(f"Beats: {len(pcav.beats.beat_times)}")
-print(f"Peaks: {len(pcav.peaks.peaks)}")
-```
-
-## Reading Example (TypeScript)
-
-```typescript
-// Fetch just the header to find section offsets
-const header = await fetch(url, { headers: { Range: 'bytes=0-100' } });
-const dir = parsePcavDirectory(header);
-
-// Fetch only the section you need
-const peaksRange = `bytes=${dir.peaks.offset}-${dir.peaks.offset + dir.peaks.length}`;
-const peaks = await fetch(url, { headers: { Range: peaksRange } });
-```
-
-## Version History
-
-The header version byte has only ever been `1` (`PCAV_VERSION` in `src/pcav.py`). The layout change below shipped without a bump; readers handle both via auto-detection.
-
-- **2026-02-05** (`d51fe6e`) — Initial specification: ANALYSIS, BEATS, PEAKS (10 peaks/s, uint16 count).
-- **2026-02-11** (`6370f8a`) — PEAKS count widened to uint32; two peak levels, editor (0x03) + overview (0x08); 0x04-0x07 deprecated.
+- 2026-02-05: v1, uint16-count 10/s peaks.
+- 2026-02-11: v1 widened peak count and changed resolution without a header version bump.
+- 2026-09-14: v2 explicit phase/meter, exact duration, absolute microseconds, per-level timebase; strict bounds and legacy compatibility.

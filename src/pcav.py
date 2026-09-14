@@ -10,6 +10,7 @@ Also supports embedding in WAV files (via write_pcav_to_wav/read_pcav_from_wav).
 """
 
 import struct
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -30,7 +31,10 @@ SECTION_THUMB_256 = 0x12
 MIPMAP_WINDOWS = [256, 8192]
 
 PCAV_MAGIC = b"PCAV"
-PCAV_VERSION = 1
+PCAV_VERSION = 2
+MAX_SECTION_BYTES = 16 * 1024 * 1024
+MAX_BEATS = 100_000
+MAX_PEAKS = 2_000_000
 
 # Key encoding table (0x00 = unknown, 0x01-0x0C = major, 0x0D-0x18 = minor)
 # Includes both sharp and flat enharmonic equivalents
@@ -60,7 +64,7 @@ KEY_MAP_REVERSE = {
 @dataclass
 class AnalysisSection:
     """Track-level analysis data."""
-    duration_seconds: int  # uint16
+    duration_seconds: float  # v2: float64, measured frame count / sample rate
     bpm: float            # stored as uint16 × 10
     key: str | None       # musical key or None
 
@@ -69,12 +73,16 @@ class AnalysisSection:
 class BeatsSection:
     """Beat timing data."""
     beat_times: list[float]  # beat times in seconds
+    first_downbeat_index: int | None = None
+    beats_per_bar: int = 4
 
 
 @dataclass
 class PeaksSection:
     """Waveform peaks (default 50 peaks/second)."""
     peaks: list[tuple[int, int]]  # (min, max) as int8 pairs
+    sample_rate: int = 48000
+    window_samples: int = 256
 
 
 @dataclass
@@ -99,91 +107,120 @@ class PCAVData:
 # --- Section Encoders ---
 
 def encode_analysis(section: AnalysisSection) -> bytes:
-    """Encode ANALYSIS section (6 bytes)."""
-    duration = min(section.duration_seconds, 65535)
-    bpm_encoded = int(round(section.bpm * 10))
-    key_byte = KEY_MAP.get(section.key, 0x00) if section.key else 0x00
-    return struct.pack("<HHBx", duration, bpm_encoded, key_byte)
+    if not math.isfinite(section.duration_seconds) or section.duration_seconds <= 0:
+        raise ValueError("Duration must be finite and positive")
+    if not math.isfinite(section.bpm) or not 0 <= section.bpm <= 6553.5:
+        raise ValueError("BPM must be finite and in range (0 means unknown)")
+    if section.key is not None and section.key not in KEY_MAP:
+        raise ValueError("Unknown musical key")
+    return struct.pack("<dHBx", section.duration_seconds, round(section.bpm * 10), KEY_MAP.get(section.key, 0))
 
 
-def decode_analysis(data: bytes) -> AnalysisSection:
-    """Decode ANALYSIS section."""
-    duration, bpm_encoded, key_byte = struct.unpack("<HHBx", data[:6])
-    key = KEY_MAP_REVERSE.get(key_byte)
-    return AnalysisSection(
-        duration_seconds=duration,
-        bpm=bpm_encoded / 10.0,
-        key=key,
-    )
+def decode_analysis(data: bytes, version: int = PCAV_VERSION) -> AnalysisSection:
+    fmt = "<HHBx" if version == 1 else "<dHBx"
+    if len(data) != struct.calcsize(fmt):
+        raise ValueError("Invalid ANALYSIS length")
+    duration, bpm, key = struct.unpack(fmt, data)
+    if not math.isfinite(duration) or duration <= 0 or key > 24:
+        raise ValueError("Invalid ANALYSIS values")
+    return AnalysisSection(duration, bpm / 10, KEY_MAP_REVERSE.get(key))
+
+
+def validate_beats(section: BeatsSection) -> None:
+    if len(section.beat_times) > MAX_BEATS:
+        raise ValueError("Too many beats")
+    previous = -1
+    for t in section.beat_times:
+        if not math.isfinite(t) or t < 0 or t <= previous:
+            raise ValueError("Beat times must be finite, nonnegative and strictly increasing")
+        previous = t
+    if not 1 <= section.beats_per_bar <= 32:
+        raise ValueError("Invalid meter")
+    idx = section.first_downbeat_index
+    if idx is not None and (not isinstance(idx, int) or not 0 <= idx < len(section.beat_times)):
+        raise ValueError("Invalid first downbeat index")
 
 
 def encode_beats(section: BeatsSection) -> bytes:
-    """Encode BEATS section as first beat + interval deltas."""
-    if not section.beat_times:
-        return struct.pack("<HH", 0, 0)
-
-    beats = section.beat_times
-    first_beat_ms = int(round(beats[0] * 1000))
-    beat_count = len(beats)
-
-    # Compute intervals in centiseconds (10ms units)
-    intervals = []
-    for i in range(1, len(beats)):
-        delta_sec = beats[i] - beats[i - 1]
-        delta_cs = int(round(delta_sec * 100))
-        intervals.append(min(max(delta_cs, 0), 255))  # clamp to uint8
-
-    return struct.pack("<HH", first_beat_ms, beat_count) + bytes(intervals)
+    validate_beats(section)
+    # Absolute microseconds: quantization error never accumulates between beats.
+    times = [round(t * 1_000_000) for t in section.beat_times]
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError("Beats collapse at microsecond resolution")
+    if any(t >= 2**53 for t in times):
+        raise ValueError("Beat timestamp exceeds safe integer range")
+    if len(times) * 8 + 12 > MAX_SECTION_BYTES:
+        raise ValueError("Too many beats")
+    idx = section.first_downbeat_index
+    return struct.pack("<IiB3x", len(times), -1 if idx is None else idx, section.beats_per_bar) + struct.pack(f"<{len(times)}Q", *times)
 
 
-def decode_beats(data: bytes) -> BeatsSection:
-    """Decode BEATS section."""
-    first_beat_ms, beat_count = struct.unpack("<HH", data[:4])
-    if beat_count == 0:
-        return BeatsSection(beat_times=[])
-
-    intervals = list(data[4:4 + beat_count - 1])
-
-    # Reconstruct beat times
-    beat_times = [first_beat_ms / 1000.0]
-    for interval_cs in intervals:
-        beat_times.append(beat_times[-1] + interval_cs / 100.0)
-
-    return BeatsSection(beat_times=beat_times)
+def decode_beats(data: bytes, version: int = PCAV_VERSION) -> BeatsSection:
+    if version == 1:
+        if len(data) < 4:
+            raise ValueError("Truncated BEATS header")
+        first, count = struct.unpack("<HH", data[:4])
+        if len(data) != 4 + max(0, count - 1):
+            raise ValueError("BEATS count does not match length")
+        times = [first / 1000] if count else []
+        time_ms = first
+        for interval in data[4:]:
+            time_ms += interval * 10
+            times.append(time_ms / 1000)
+        result = BeatsSection(times)
+    else:
+        if len(data) < 12:
+            raise ValueError("Truncated BEATS header")
+        count, idx, meter = struct.unpack("<IiB3x", data[:12])
+        if count > MAX_BEATS or len(data) != 12 + count * 8 or idx < -1:
+            raise ValueError("Invalid BEATS count or phase")
+        times_us = struct.unpack(f"<{count}Q", data[12:])
+        if any(t >= 2**53 for t in times_us):
+            raise ValueError("Beat timestamp exceeds safe integer range")
+        result = BeatsSection([t / 1_000_000 for t in times_us], None if idx == -1 else idx, meter)
+    validate_beats(result)
+    return result
 
 
 def encode_peaks(section: PeaksSection) -> bytes:
-    """Encode PEAKS section as uint32 count + int8 min/max pairs."""
-    peak_count = len(section.peaks)
-    data = struct.pack("<I", peak_count)
+    if not 1 <= section.sample_rate <= 768000 or not 1 <= section.window_samples <= 2**24:
+        raise ValueError("Invalid peak timebase")
+    if len(section.peaks) > MAX_PEAKS or 12 + 2 * len(section.peaks) > MAX_SECTION_BYTES:
+        raise ValueError("Too many peaks")
+    data = bytearray(struct.pack("<III", len(section.peaks), section.sample_rate, section.window_samples))
+    for lo, hi in section.peaks:
+        if not -128 <= lo <= hi <= 127:
+            raise ValueError("Invalid peak range")
+        data.extend(struct.pack("bb", lo, hi))
+    return bytes(data)
 
-    for min_val, max_val in section.peaks:
-        # Clamp to int8 range
-        min_clamped = max(-128, min(127, min_val))
-        max_clamped = max(-128, min(127, max_val))
-        data += struct.pack("bb", min_clamped, max_clamped)
 
-    return data
-
-
-def decode_peaks(data: bytes) -> PeaksSection:
-    """Decode PEAKS section. Auto-detects uint16 (old) vs uint32 (new) header."""
-    # Try uint16 first: if 2 + count * 2 == len(data), it's old format
-    count16 = struct.unpack("<H", data[:2])[0]
-    if 2 + count16 * 2 == len(data):
-        peak_count = count16
-        data_start = 2
+def decode_peaks(data: bytes, version: int = PCAV_VERSION, window: int = 256) -> PeaksSection:
+    if len(data) < (2 if version == 1 else 12):
+        raise ValueError("Truncated PEAKS header")
+    rate = 48000
+    if version == 1:
+        count = struct.unpack("<H", data[:2])[0]
+        start = 2
+        if len(data) != 2 + count * 2:
+            if len(data) < 4:
+                raise ValueError("Truncated PEAKS count")
+            count = struct.unpack("<I", data[:4])[0]
+            start = 4
+        elif window == 256:
+            # Original v1 editor format was 10 peaks/s, with a uint16 count.
+            window = 4800
     else:
-        peak_count = struct.unpack("<I", data[:4])[0]
-        data_start = 4
-
-    peaks = []
-    for i in range(peak_count):
-        offset = data_start + i * 2
-        min_val, max_val = struct.unpack("bb", data[offset:offset + 2])
-        peaks.append((min_val, max_val))
-
-    return PeaksSection(peaks=peaks)
+        count, rate, window = struct.unpack("<III", data[:12])
+        start = 12
+        if not 1 <= rate <= 768000 or not 1 <= window <= 2**24:
+            raise ValueError("Invalid peak timebase")
+    if count > MAX_PEAKS or len(data) != start + count * 2:
+        raise ValueError("PEAKS count does not match length")
+    peaks = list(struct.iter_unpack("bb", data[start:]))
+    if any(lo > hi for lo, hi in peaks):
+        raise ValueError("Invalid peak range")
+    return PeaksSection(peaks, rate, window)
 
 
 def encode_thumbnail(section: ThumbnailSection) -> bytes:
@@ -200,6 +237,9 @@ def decode_thumbnail(data: bytes, size: int) -> ThumbnailSection:
 
 def build_pcav_payload(pcav: PCAVData) -> bytes:
     """Build complete PCAV payload from sections."""
+    if pcav.analysis and pcav.beats:
+        if any(t >= pcav.analysis.duration_seconds for t in pcav.beats.beat_times):
+            raise ValueError("Beat lies outside audio duration")
     sections: list[tuple[int, bytes]] = []
 
     if pcav.analysis:
@@ -241,41 +281,41 @@ def build_pcav_payload(pcav: PCAVData) -> bytes:
 
 
 def parse_pcav_payload(payload: bytes) -> PCAVData:
-    """Parse PCAV payload into sections."""
     if len(payload) < 6 or payload[:4] != PCAV_MAGIC:
-        raise ValueError("Invalid PCAV magic bytes")
-
-    version = payload[4]
-    if version != PCAV_VERSION:
+        raise ValueError("Invalid PCAV header")
+    version, count = payload[4:6]
+    if version not in (1, 2):
         raise ValueError(f"Unsupported PCAV version: {version}")
-
-    section_count = payload[5]
+    header_size = 6 + count * 9
+    if len(payload) < header_size:
+        raise ValueError("Truncated PCAV directory")
+    entries = [struct.unpack_from("<BII", payload, 6 + i * 9) for i in range(count)]
+    seen = set()
+    end = header_size
+    for kind, offset, length in sorted(entries, key=lambda e: e[1]):
+        if kind in seen or offset < end or length > MAX_SECTION_BYTES or offset + length > len(payload):
+            raise ValueError("Invalid, overlapping or truncated PCAV section")
+        seen.add(kind)
+        end = offset + length
     pcav = PCAVData()
-
-    # Parse directory
-    for i in range(section_count):
-        dir_offset = 6 + i * 9
-        section_type, data_offset, data_length = struct.unpack(
-            "<BII", payload[dir_offset:dir_offset + 9]
-        )
-
-        section_data = payload[data_offset:data_offset + data_length]
-
-        if section_type == SECTION_ANALYSIS:
-            pcav.analysis = decode_analysis(section_data)
-        elif section_type == SECTION_BEATS:
-            pcav.beats = decode_beats(section_data)
-        elif section_type == SECTION_PEAKS:
-            pcav.peaks = decode_peaks(section_data)
-        elif section_type == SECTION_PEAKS_OVERVIEW:
-            pcav.overview_peaks = decode_peaks(section_data)
-        elif section_type == SECTION_THUMB_64:
-            pcav.thumb_64 = decode_thumbnail(section_data, 64)
-        elif section_type == SECTION_THUMB_128:
-            pcav.thumb_128 = decode_thumbnail(section_data, 128)
-        elif section_type == SECTION_THUMB_256:
-            pcav.thumb_256 = decode_thumbnail(section_data, 256)
-
+    for kind, offset, length in entries:
+        data = payload[offset:offset + length]
+        if kind == SECTION_ANALYSIS:
+            pcav.analysis = decode_analysis(data, version)
+        elif kind == SECTION_BEATS:
+            pcav.beats = decode_beats(data, version)
+        elif kind in (SECTION_PEAKS, SECTION_PEAKS_OVERVIEW):
+            section = decode_peaks(data, version, 256 if kind == SECTION_PEAKS else 8192)
+            if kind == SECTION_PEAKS:
+                pcav.peaks = section
+            else:
+                pcav.overview_peaks = section
+        elif kind in (SECTION_THUMB_64, SECTION_THUMB_128, SECTION_THUMB_256):
+            size = {SECTION_THUMB_64: 64, SECTION_THUMB_128: 128, SECTION_THUMB_256: 256}[kind]
+            setattr(pcav, f"thumb_{size}", decode_thumbnail(data, size))
+    if version == 2 and pcav.analysis and pcav.beats:
+        if any(t >= pcav.analysis.duration_seconds for t in pcav.beats.beat_times):
+            raise ValueError("Beat lies outside audio duration")
     return pcav
 
 
@@ -419,7 +459,7 @@ def lowpass_filter(samples: np.ndarray, sample_rate: int, cutoff_hz: int = 300) 
     nyquist = sample_rate / 2
     normalized_cutoff = min(cutoff_hz / nyquist, 0.99)
     sos = signal.butter(4, normalized_cutoff, btype='low', output='sos')
-    return signal.sosfiltfilt(sos, samples).astype(np.float64)
+    return signal.sosfiltfilt(sos, samples, padlen=min(15, len(samples) - 1)).astype(np.float64)
 
 
 def build_peak_mipmaps(samples, sample_rate: int, filter_hz: int = 300) -> list[PeaksSection]:
@@ -430,34 +470,24 @@ def build_peak_mipmaps(samples, sample_rate: int, filter_hz: int = 300) -> list[
 
     Returns [editor_peaks, overview_peaks].
     """
-    samples = np.asarray(samples)
+    samples = np.asarray(samples, dtype=np.float64)
+    if samples.ndim != 1 or not len(samples) or not np.isfinite(samples).all():
+        raise ValueError("Peaks require nonempty finite mono samples")
+    if not isinstance(sample_rate, int) or not 1 <= sample_rate <= 768000:
+        raise ValueError("Invalid sample rate")
     if filter_hz:
         samples = lowpass_filter(samples, sample_rate, filter_hz)
-
-    # Normalize to [-1, 1] so int8 peaks use full range
     peak_amp = np.max(np.abs(samples))
     if peak_amp > 0:
         samples = samples / peak_amp
-
-    levels: list[PeaksSection] = []
-
+    levels = []
     for window in MIPMAP_WINDOWS:
-        num_peaks = len(samples) // window
-        if num_peaks == 0:
-            levels.append(PeaksSection(peaks=[]))
-            continue
-
-        truncated = samples[:num_peaks * window]
-        windows = truncated.reshape(num_peaks, window)
-        mins = np.min(windows, axis=1)
-        maxs = np.max(windows, axis=1)
-
-        peaks = [
-            (int(round(mn * 127)), int(round(mx * 127)))
-            for mn, mx in zip(mins, maxs)
-        ]
-        levels.append(PeaksSection(peaks=peaks))
-
+        starts = np.arange(0, len(samples), window)
+        # Include the final partial window, including one-sample inputs.
+        mins = np.minimum.reduceat(samples, starts)
+        maxs = np.maximum.reduceat(samples, starts)
+        peaks = [(int(round(lo * 127)), int(round(hi * 127))) for lo, hi in zip(mins, maxs)]
+        levels.append(PeaksSection(peaks, sample_rate, window))
     return levels
 
 
@@ -519,7 +549,7 @@ def beats_from_times(beat_times: list[float]) -> BeatsSection:
 def analysis_from_dict(data: dict) -> AnalysisSection:
     """Create AnalysisSection from analysis dict."""
     return AnalysisSection(
-        duration_seconds=int(round(data.get("duration", 0))),
+        duration_seconds=float(data.get("duration", 0)),
         bpm=float(data.get("bpm", 0)),
         key=data.get("key"),
     )

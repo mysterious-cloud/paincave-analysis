@@ -13,7 +13,6 @@ Output uses camelCase JSON keys for direct consumption by TypeScript.
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -33,28 +32,24 @@ def load_audio(audio_path: Path) -> tuple[np.ndarray, int]:
 
     # For m4a/mp3, use ffmpeg to decode
     if suffix in ['.m4a', '.mp3', '.aac']:
-        # Convert to wav using ffmpeg
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            tmp_path = tmp.name
-
-        print("Converting with ffmpeg...")
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-i', str(audio_path), '-ar', '44100', '-ac', '1', tmp_path],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-
-        audio, sr = sf.read(tmp_path)
-
-        # Clean up temp file
-        os.unlink(tmp_path)
+        with tempfile.TemporaryDirectory(prefix="paincave-analysis-") as tmp:
+            tmp_path = str(Path(tmp) / "decoded.wav")
+            result = subprocess.run(
+                ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path), '-ar', '44100', '-ac', '1', tmp_path],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed: {result.stderr}")
+            audio, sr = sf.read(tmp_path)
     else:
         audio, sr = sf.read(audio_path)
 
     # Convert to mono if stereo
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+
+    if not len(audio) or not np.isfinite(audio).all():
+        raise ValueError("Audio must contain nonempty finite samples")
 
     print(f"Duration: {len(audio) / sr:.1f}s ({len(audio) / sr / 60:.1f} minutes)")
     print(f"Sample rate: {sr} Hz")
@@ -82,6 +77,9 @@ def extract_beats(audio_path: Path, min_bpm: int = 100, max_bpm: int = 180) -> t
 
     # Returns array of [time, beat_position] where beat_position is 1-4
     beat_data = dbn(activations)
+
+    if len(beat_data) == 0:
+        return np.array([], dtype=float), np.array([], dtype=int)
 
     beat_times = beat_data[:, 0]
     beat_positions = beat_data[:, 1].astype(int)
@@ -136,6 +134,10 @@ def compute_tempo_curve(beat_times: np.ndarray, window: int = 8, reference_bpm: 
     print("Computing tempo curve...")
 
     intervals = np.diff(beat_times)
+    if not np.isfinite(beat_times).all() or np.any(intervals <= 0):
+        raise ValueError("Beat times must be finite and strictly increasing")
+    if len(intervals) == 0:
+        return np.array([], dtype=float), []
     local_bpm = 60 / intervals
 
     smoothed_bpm = median_filter(local_bpm, size=window)
@@ -160,6 +162,8 @@ def compute_tempo_curve(beat_times: np.ndarray, window: int = 8, reference_bpm: 
 def detect_tempo_segments(bpm_curve: np.ndarray, threshold: float = 3.0) -> list[dict]:
     """Detect segments where tempo is stable."""
     segments = []
+    if len(bpm_curve) == 0:
+        return segments
     current_start = 0
     current_bpm = bpm_curve[0]
 
@@ -194,18 +198,14 @@ def compute_band_energy(audio: np.ndarray, sr: int, low: int = 20, high: int = 1
 
     sos = signal.butter(4, [low_norm, high_norm], btype='band', output='sos')
 
-    try:
-        filtered = signal.sosfiltfilt(sos, audio)
-    except Exception as e:
-        print(f"Warning: Band filter failed: {e}")
-        return np.zeros(int(len(audio) / sr))
+    filtered = signal.sosfiltfilt(sos, audio, padlen=min(27, len(audio) - 1))
 
     filtered = np.nan_to_num(filtered, nan=0.0)
 
     window_samples = sr
     energy = []
 
-    for i in range(0, len(filtered) - window_samples, window_samples):
+    for i in range(0, len(filtered), window_samples):
         chunk = filtered[i:i + window_samples]
         rms = np.sqrt(np.mean(chunk ** 2))
         if np.isnan(rms) or np.isinf(rms):
@@ -217,58 +217,29 @@ def compute_band_energy(audio: np.ndarray, sr: int, low: int = 20, high: int = 1
 
 def compute_kick_density(
     bass_energy: np.ndarray,
-    beats: list[dict]
+    beats: list[dict],
+    duration: float | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
-    """Compute kick/bass presence per bar using bass energy."""
-    print("Computing kick density per bar (from bass energy)...")
-
-    bar_boundaries = []
-    bars_seen = {}
-
-    for beat in beats:
-        bar_num = beat["bar"]
-        if bar_num <= 0:
+    """Time-weighted bass energy over complete bar intervals, including beat four."""
+    downbeats = [b for b in beats if b["bar"] > 0 and b["beat"] == 1]
+    if not downbeats or not len(bass_energy):
+        return np.array([], dtype=float), []
+    end_time = duration if duration is not None else float(len(bass_energy))
+    maximum = float(np.max(bass_energy))
+    values, info = [], []
+    for i, beat in enumerate(downbeats):
+        start = beat["t"]
+        end = downbeats[i + 1]["t"] if i + 1 < len(downbeats) else end_time
+        if end <= start:
             continue
-        if bar_num not in bars_seen:
-            bars_seen[bar_num] = {"start": beat["t"], "end": beat["t"]}
-        else:
-            bars_seen[bar_num]["end"] = beat["t"]
-
-    for bar_num in sorted(bars_seen.keys()):
-        bar_data = bars_seen[bar_num]
-        bar_boundaries.append((bar_num, bar_data["start"], bar_data["end"]))
-
-    density_per_bar = []
-    bar_info = []
-
-    max_bass = np.max(bass_energy) if len(bass_energy) > 0 else 1
-
-    # Interpolate bass energy at sub-second resolution for accurate bar alignment
-    # bass_energy has one value per second; sample it at 10x resolution
-    energy_times = np.arange(len(bass_energy))
-    fine_times = np.linspace(0, len(bass_energy) - 1, len(bass_energy) * 10)
-    fine_energy = np.interp(fine_times, energy_times, bass_energy)
-    fine_rate = 10  # samples per second
-
-    for bar_num, bar_start, bar_end in bar_boundaries:
-        start_idx = int(round(bar_start * fine_rate))
-        end_idx = int(round(bar_end * fine_rate))
-
-        start_idx = max(0, min(start_idx, len(fine_energy) - 1))
-        end_idx = max(start_idx + 1, min(end_idx, len(fine_energy)))
-
-        bar_bass = fine_energy[start_idx:end_idx]
-        density = float(np.mean(bar_bass)) / max_bass if max_bass > 0 else 0
-
-        density_per_bar.append(density)
-        bar_info.append({
-            "bar": bar_num,
-            "start_t": round(bar_start, 3),
-            "end_t": round(bar_end, 3),
-            "kick_density": round(density, 3),
-        })
-
-    return np.array(density_per_bar), bar_info
+        weighted = 0.0
+        for second in range(max(0, int(start)), min(len(bass_energy), int(np.ceil(end)))):
+            overlap = max(0, min(end, second + 1) - max(start, second))
+            weighted += float(bass_energy[second]) * overlap
+        density = weighted / (end - start) / maximum if maximum > 0 else 0.0
+        values.append(density)
+        info.append({"bar": beat["bar"], "start_t": start, "end_t": end, "kick_density": round(density, 3)})
+    return np.array(values), info
 
 
 def detect_kick_zones(
@@ -298,7 +269,7 @@ def detect_kick_zones(
                 end_sec = bar_info[i]["start_t"]
                 zones.append({
                     "type": current_zone_type,
-                    "startBar": current_zone_start + 1,
+                    "startBar": bar_info[current_zone_start]["bar"],
                     "durationBars": zone_length,
                     "startSeconds": round(start_sec, 2),
                     "durationSeconds": round(end_sec - start_sec, 2),
@@ -313,14 +284,11 @@ def detect_kick_zones(
         if duration is not None:
             final_end_t = duration
         else:
-            # Estimate: add one bar duration to last bar's start
-            last_bar = bar_info[-1]
-            bar_duration = last_bar["end_t"] - last_bar["start_t"]
-            final_end_t = last_bar["start_t"] + bar_duration * 4 / 3  # Extend beat 4 to next beat 1
+            final_end_t = bar_info[-1]["end_t"]
         start_sec = bar_info[current_zone_start]["start_t"]
         zones.append({
             "type": current_zone_type,
-            "startBar": current_zone_start + 1,
+            "startBar": bar_info[current_zone_start]["bar"],
             "durationBars": zone_length,
             "startSeconds": round(start_sec, 2),
             "durationSeconds": round(final_end_t - start_sec, 2),
@@ -475,9 +443,7 @@ def build_beats_array(
             conf = confidences[i] if confidences is not None else 1.0
 
             if i < first_downbeat_idx:
-                pickup_beat = (i - first_downbeat_idx) % 4
-                if pickup_beat == 0:
-                    pickup_beat = 4
+                pickup_beat = (i - first_downbeat_idx) % 4 + 1
                 beats.append({
                     "t": round(float(time), 3),
                     "bar": 0,
@@ -521,27 +487,39 @@ def analyze_audio(
 ) -> dict:
     """Main analysis pipeline."""
 
+    if not 0 < min_bpm < max_bpm:
+        raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
+    if reference_bpm is not None and (not np.isfinite(reference_bpm) or reference_bpm <= 0):
+        raise ValueError("Reference BPM must be finite and positive")
     audio, sr = load_audio(audio_path)
     duration = len(audio) / sr
 
-    beat_times, beat_positions = extract_beats(audio_path, min_bpm, max_bpm)
+    if duration < 1 or not np.any(audio):
+        beat_times, beat_positions = np.array([], dtype=float), np.array([], dtype=int)
+    else:
+        beat_times, beat_positions = extract_beats(audio_path, min_bpm, max_bpm)
+
+    if np.any(beat_times < 0) or np.any(beat_times >= duration):
+        raise ValueError("Detected beats lie outside audio duration")
 
     tempo_curve, tempo_segments = compute_tempo_curve(beat_times, reference_bpm=reference_bpm)
-    global_bpm = float(np.median(tempo_curve))
+    global_bpm = float(np.median(tempo_curve)) if len(tempo_curve) else 0.0
 
     low_band = compute_band_energy(audio, sr, low=20, high=150)
 
     if first_downbeat is not None:
-        first_downbeat_t = first_downbeat
+        if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration or not len(beat_times):
+            raise ValueError("First downbeat must identify a beat within the audio")
+        first_downbeat_t = float(beat_times[np.argmin(np.abs(beat_times - first_downbeat))])
         print(f"Using user-specified first downbeat: {first_downbeat_t:.3f}s")
     else:
-        first_downbeat_t = detect_first_kick(audio, sr, beat_times, beat_positions)
+        first_downbeat_t = detect_first_kick(audio, sr, beat_times, beat_positions) if len(beat_times) else 0.0
 
     beat_confidences = compute_beat_confidence(beat_times, global_bpm)
 
     beats_data = build_beats_array(beat_times, beat_positions, first_downbeat_t, beat_confidences)
 
-    kick_density, kick_bar_info = compute_kick_density(low_band, beats_data)
+    kick_density, kick_bar_info = compute_kick_density(low_band, beats_data, duration)
 
     work_zones = detect_kick_zones(kick_density, kick_bar_info, duration=duration)
 
@@ -550,7 +528,7 @@ def analyze_audio(
 
     return {
         "version": "3.0",
-        "duration": round(duration, 1),
+        "duration": duration,
         "sampleRate": sr,
         "bpm": round(global_bpm, 1),
         "key": key,

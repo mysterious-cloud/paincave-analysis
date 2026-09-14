@@ -25,20 +25,15 @@ def load_audio_samples(audio_path: Path) -> np.ndarray:
 
     # For m4a/mp3, decode with ffmpeg to get consistent PCM data
     if suffix in ['.m4a', '.mp3', '.aac']:
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            tmp_path = tmp.name
-
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-i', str(audio_path), '-ar', '44100', '-ac', '1', tmp_path],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-
-        audio, _ = sf.read(tmp_path)
-
-        import os
-        os.unlink(tmp_path)
+        with tempfile.TemporaryDirectory(prefix="paincave-hash-") as tmp:
+            tmp_path = str(Path(tmp) / "decoded.wav")
+            result = subprocess.run(
+                ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path), '-ar', '44100', '-ac', '1', tmp_path],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed: {result.stderr}")
+            audio, _ = sf.read(tmp_path)
     else:
         audio, _ = sf.read(audio_path)
 
