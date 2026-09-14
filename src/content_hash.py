@@ -18,8 +18,8 @@ import soundfile as sf
 def load_audio_samples(audio_path: Path) -> np.ndarray:
     """Load audio file and return raw samples as a numpy array.
 
-    Handles various formats (wav, mp3, m4a) by decoding to raw PCM.
-    Returns mono audio at original sample rate.
+    m4a/mp3/aac are decoded by ffmpeg to 44.1 kHz; other formats are read at
+    their native sample rate. Returns mono audio.
     """
     suffix = audio_path.suffix.lower()
 
@@ -52,9 +52,10 @@ def load_audio_samples(audio_path: Path) -> np.ndarray:
 def compute_content_hash(audio_path: Path, truncate: int = 12) -> str:
     """Compute a content hash for an audio file.
 
-    The hash is based on the raw audio samples, not file metadata.
-    This ensures the same audio content produces the same hash
-    regardless of file format, encoder settings, or metadata.
+    The hash is based on the decoded samples, so tags and headers do not
+    affect it. Format and sample rate do: the same audio as WAV at different
+    rates, or as M4A, hashes differently. It also differs from the paincave
+    server's hash.
 
     Args:
         audio_path: Path to the audio file

@@ -18,7 +18,7 @@ What `src/import_track.py` (via `bin/import` or `../paincave/bin/analyze.sh`) wr
 └── plans/                # NOT written here — Studio-era leftover
 ```
 
-- `{library}` = `--library`, else `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks` relative to this repo. The repo's scripts do not load a `.env` file; set the variable in the shell or pass `--library`.
+- `{library}` = `--library`, else `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks` relative to this repo. `bin/import` and `src/import_track.py` load no `.env`. `../paincave/bin/analyze.sh` and `import.sh` first export paincave's `.env`, `.env.local`, `.env.development` and `.env.development.local`, so a `PAINCAVE_TRACKS_DIR` set there applies; `import.sh` also always passes `--library`.
 - `{hash}` = 12-char content hash of the input file (see [Content hash](#content-hash)).
 - Files are written in the order listed above. A failure part-way leaves a partial directory, and re-running without `--force` prints "Track already exists" and exits 0.
 - The paincave app database is the source of truth for plans and metadata edits. These files are the import output, not a live record.

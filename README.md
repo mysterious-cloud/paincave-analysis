@@ -36,7 +36,7 @@ uv run python src/import_track.py track.wav --title "Dark Descent" --genres "dar
 | `--min-bpm` / `--max-bpm` | `100` / `180` | Beat-tracking tempo range |
 | `-f, --force` | off | Re-import an existing hash. **Deletes the track dir first**, see below |
 
-No `.env` is loaded. Export `PAINCAVE_TRACKS_DIR` or pass `--library`. The last stdout line is `Hash: <hash>`, which `../paincave/bin/import.sh` parses.
+`bin/import` loads no `.env`: export `PAINCAVE_TRACKS_DIR` or pass `--library`. `../paincave/bin/analyze.sh` and `import.sh` first export paincave's `.env`, `.env.local`, `.env.development` and `.env.development.local`; `import.sh` also always passes `--library`. The last stdout line is `Hash: <hash>`, which `../paincave/bin/import.sh` parses.
 
 Debug CLIs: `uv run python src/analyze.py <file> [-o out.json]` dumps the full analysis JSON, and `uv run python src/content_hash.py <file> [--full]` prints the hash.
 
