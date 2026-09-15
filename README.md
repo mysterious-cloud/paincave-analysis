@@ -38,6 +38,8 @@ uv run python src/import_track.py track.wav --title "Dark Descent" --genres "dar
 | `--first-downbeat` | detected | Bar 1 time, snapped to a detected beat |
 | `--source-file` / `--processing-record` | input / none | Preserve and verify source lineage for a derived master |
 
+Audio under 1 s, digital silence, or with fewer than 8 beats is refused: exit 1, `Error: refused <file>: <reason>; nothing written` on stderr. See [output-formats.md](docs/output-formats.md#refused-input).
+
 With `--force`, omitted `--title`, `--artist` and `--genres` (and `--source-id` when the source has no SUNO id) keep the active track's `metadata.json` values.
 
 `bin/import` loads no `.env`: export `PAINCAVE_TRACKS_DIR` or pass `--library`. `../paincave/bin/analyze.sh` and `import.sh` first export paincave's `.env`, `.env.local`, `.env.development` and `.env.development.local`; `import.sh` also always passes `--library`. The last stdout line is `Hash: <hash>`, which `../paincave/bin/import.sh` parses along with `Track already exists:` and `Revision: <dir> (candidate; ...)`.
@@ -61,7 +63,7 @@ PCAV v2 preserves phase, exact duration and waveform timebase. Source/master che
 
 ## Remaining boundaries
 
-- Reanalysis creates a candidate revision; publication/review in the app is not implemented. Existing root files stay active. Candidates are write-once by convention only (writable folders), each run stores full copies of `source.*`, `original.wav` and `audio.m4a` with no dedupe, and a killed run leaves a `.staging-*` folder in the library.
+- Reanalysis creates a candidate revision; publication/review in the app is not implemented. Existing root files stay active. Candidates are write-once by convention only (writable folders), and each run stores full copies of `source.*`, `original.wav` and `audio.m4a` with no dedupe. SIGTERM removes the run's `.staging-*` folder; a SIGKILLed run's folder stays until the next import into that library sweeps it.
 - **The hash does not match the server's.** `src/content_hash.py` and `../paincave/server/src/services/audioService.ts` decode differently, so the same file gets different hashes. The Python hash also changes with input format and sample rate. See [output-formats.md](docs/output-formats.md#content-hash).
 - New imports are validated and staged before promotion. Partial directories fail explicitly; `--force` can stage a recovery candidate only while identity still verifies (legacy: `original.wav` present and hashing to the folder name; with `manifest.json`: input byte-identical to the recorded master or matching its fingerprint, and the retained source present with its recorded checksum), and it never repairs the active files.
 - `mutagen` is declared in `pyproject.toml` but not imported anywhere.

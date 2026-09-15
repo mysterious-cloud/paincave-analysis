@@ -12,41 +12,32 @@ Output uses camelCase JSON keys for direct consumption by TypeScript.
 """
 
 import argparse
+import concurrent.futures
 import json
-import subprocess
+import os
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 from scipy import signal
 from scipy.ndimage import median_filter
 
+from content_hash import load_audio_samples
 
-def load_audio(audio_path: Path) -> tuple[np.ndarray, int]:
-    """Load audio file and convert to mono. Uses ffmpeg for m4a/mp3."""
+MIN_DURATION_SECONDS = 1
+MIN_BEATS = 8  # two bars of 4/4: a tempo median, a downbeat and one complete bar
+
+
+class NoBeatGrid(ValueError):
+    """Audio no ride can use: shorter than 1 s, digital silence, or without a measurable beat grid."""
+
+
+def load_audio(audio_path: Path, data: bytes | None = None) -> tuple[np.ndarray, int]:
+    """Load audio as mono, with the same decode as the content hash. `data` is the file's bytes, if already read."""
     print(f"Loading audio: {audio_path}")
 
-    suffix = audio_path.suffix.lower()
-
-    # For m4a/mp3, use ffmpeg to decode
-    if suffix in ['.m4a', '.mp3', '.aac']:
-        with tempfile.TemporaryDirectory(prefix="paincave-analysis-") as tmp:
-            tmp_path = str(Path(tmp) / "decoded.wav")
-            result = subprocess.run(
-                ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path), '-ar', '44100', '-ac', '1', tmp_path],
-                capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-            audio, sr = sf.read(tmp_path)
-    else:
-        audio, sr = sf.read(audio_path)
-
-    # Convert to mono if stereo
-    if len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
+    audio, sr = load_audio_samples(audio_path, data)
 
     if not len(audio) or not np.isfinite(audio).all():
         raise ValueError("Audio must contain nonempty finite samples")
@@ -57,15 +48,25 @@ def load_audio(audio_path: Path) -> tuple[np.ndarray, int]:
     return audio, sr
 
 
-def extract_beats(audio_path: Path, min_bpm: int = 100, max_bpm: int = 180) -> tuple[np.ndarray, np.ndarray]:
-    """Extract beats and downbeats using madmom."""
+def require_sound(audio: np.ndarray, sr: int) -> None:
+    """Refuse audio too short or too quiet to carry a beat grid."""
+    duration = len(audio) / sr
+    if duration < MIN_DURATION_SECONDS:
+        raise NoBeatGrid(f"audio is {duration:.3f} s long; at least {MIN_DURATION_SECONDS} s required")
+    if not np.any(audio):
+        raise NoBeatGrid("audio is digital silence")
+
+
+def extract_beats(audio: Path | np.ndarray, min_bpm: int = 100, max_bpm: int = 180) -> tuple[np.ndarray, np.ndarray]:
+    """Extract beats and downbeats using madmom; `audio` is a file path or a 44.1 kHz mono madmom Signal."""
     print("Extracting beats with madmom...")
 
     from madmom.features.downbeats import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor
 
-    # RNN processor for beat/downbeat activations
-    rnn = RNNDownBeatProcessor()
-    activations = rnn(str(audio_path))
+    # The ensemble of 8 BLSTMs runs one per process; predictions are averaged in fixed order, so the
+    # result is identical to a serial run. Each network is a Python-level recurrence, so threads can't help.
+    rnn = RNNDownBeatProcessor(num_threads=min(8, os.cpu_count() or 1))
+    activations = rnn(audio if isinstance(audio, np.ndarray) else str(audio))
 
     # DBN processor for beat tracking
     dbn = DBNDownBeatTrackingProcessor(
@@ -89,18 +90,20 @@ def extract_beats(audio_path: Path, min_bpm: int = 100, max_bpm: int = 180) -> t
     return beat_times, beat_positions
 
 
-def detect_key(audio_path: Path) -> str | None:
-    """Detect musical key using madmom CNN."""
+def detect_key(audio: Path | np.ndarray) -> str | None:
+    """Detect musical key using madmom CNN; `audio` is a file path or a 44.1 kHz mono madmom Signal."""
     print("Detecting key...")
+    key_start = time.monotonic()
 
     try:
         from madmom.features.key import CNNKeyRecognitionProcessor, key_prediction_to_label
 
         proc = CNNKeyRecognitionProcessor()
-        probs = proc(str(audio_path))
+        probs = proc(audio if isinstance(audio, np.ndarray) else str(audio))
         key = key_prediction_to_label(probs)
 
         print(f"Key: {key}")
+        print(f"timing: key {time.monotonic() - key_start:.1f}s", file=sys.stderr)
         return key
     except Exception as e:
         print(f"Warning: Key detection failed: {e}")
@@ -188,17 +191,16 @@ def detect_tempo_segments(bpm_curve: np.ndarray, threshold: float = 3.0) -> list
     return segments
 
 
-def compute_band_energy(audio: np.ndarray, sr: int, low: int = 20, high: int = 150) -> np.ndarray:
-    """Compute energy in a frequency band (e.g., bass 20-150 Hz)."""
-    print(f"Computing {low}-{high} Hz band energy...")
-
+def band_pass(audio: np.ndarray, sr: int, low: int = 20, high: int = 150) -> np.ndarray:
+    """Zero-phase 4th-order Butterworth band-pass; the default 20-150 Hz band holds kick and bass."""
     nyquist = sr / 2
-    low_norm = low / nyquist
-    high_norm = min(high / nyquist, 0.99)
+    sos = signal.butter(4, [low / nyquist, min(high / nyquist, 0.99)], btype='band', output='sos')
+    return signal.sosfiltfilt(sos, audio, padlen=min(27, len(audio) - 1))
 
-    sos = signal.butter(4, [low_norm, high_norm], btype='band', output='sos')
 
-    filtered = signal.sosfiltfilt(sos, audio, padlen=min(27, len(audio) - 1))
+def compute_band_energy(filtered: np.ndarray, sr: int) -> np.ndarray:
+    """RMS energy per second of a band-passed signal."""
+    print("Computing band energy...")
 
     filtered = np.nan_to_num(filtered, nan=0.0)
 
@@ -301,7 +303,7 @@ def detect_kick_zones(
 
 
 def detect_first_kick(
-    audio: np.ndarray,
+    bass: np.ndarray,
     sr: int,
     beat_times: np.ndarray,
     beat_positions: np.ndarray
@@ -315,16 +317,12 @@ def detect_first_kick(
     """
     print("Detecting first kick for bar alignment...")
 
-    nyquist = sr / 2
-    sos = signal.butter(4, [20 / nyquist, 150 / nyquist], btype='band', output='sos')
-    bass = signal.sosfiltfilt(sos, audio)
-
     envelope = np.abs(bass)
     smooth_samples = int(0.01 * sr)
     envelope = np.convolve(envelope, np.ones(smooth_samples) / smooth_samples, mode='same')
 
     # Find the loudest section (likely the main drop/chorus with kicks)
-    duration = len(audio) / sr
+    duration = len(bass) / sr
     window_sec = 10  # Analyze 10-second windows
     window_samples = window_sec * sr
     max_energy = 0
@@ -484,36 +482,50 @@ def analyze_audio(
     max_bpm: int = 180,
     reference_bpm: float | None = None,
     first_downbeat: float | None = None,
+    audio: tuple[np.ndarray, int] | None = None,
 ) -> dict:
-    """Main analysis pipeline."""
+    """Main analysis pipeline. `audio` is the file's already decoded (samples, rate), if any."""
 
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
     if reference_bpm is not None and (not np.isfinite(reference_bpm) or reference_bpm <= 0):
         raise ValueError("Reference BPM must be finite and positive")
-    audio, sr = load_audio(audio_path)
+    audio, sr = audio if audio is not None else load_audio(audio_path)
     duration = len(audio) / sr
+    require_sound(audio, sr)
 
-    if duration < 1 or not np.any(audio):
-        beat_times, beat_positions = np.array([], dtype=float), np.array([], dtype=int)
-    else:
-        beat_times, beat_positions = extract_beats(audio_path, min_bpm, max_bpm)
+    from madmom.audio.signal import Signal
+    # One 44.1 kHz mono decode feeds both models; each would otherwise decode the file itself.
+    madmom_signal = Signal(str(audio_path), sample_rate=44100, num_channels=1)
+    # Key detection (single CNN) runs on a thread while beat tracking waits on its worker processes.
+    # Both only read the signal; the module-level name is looked up at call time so tests can stub it.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        key_future = executor.submit(lambda: detect_key(madmom_signal))
+        beats_start = time.monotonic()
+        beat_times, beat_positions = extract_beats(madmom_signal, min_bpm, max_bpm)
+        print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
+        key = key_future.result()
 
     if np.any(beat_times < 0) or np.any(beat_times >= duration):
         raise ValueError("Detected beats lie outside audio duration")
+    if len(beat_times) < MIN_BEATS:
+        raise NoBeatGrid(f"no beat grid: {len(beat_times)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
 
     tempo_curve, tempo_segments = compute_tempo_curve(beat_times, reference_bpm=reference_bpm)
-    global_bpm = float(np.median(tempo_curve)) if len(tempo_curve) else 0.0
+    global_bpm = float(np.median(tempo_curve))
 
-    low_band = compute_band_energy(audio, sr, low=20, high=150)
+    zones_start = time.monotonic()
+    # One 20-150 Hz filter pass feeds both bar energy and downbeat alignment.
+    bass = band_pass(audio, sr)
+    low_band = compute_band_energy(bass, sr)
 
     if first_downbeat is not None:
-        if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration or not len(beat_times):
+        if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration:
             raise ValueError("First downbeat must identify a beat within the audio")
         first_downbeat_t = float(beat_times[np.argmin(np.abs(beat_times - first_downbeat))])
         print(f"Using user-specified first downbeat: {first_downbeat_t:.3f}s")
     else:
-        first_downbeat_t = detect_first_kick(audio, sr, beat_times, beat_positions) if len(beat_times) else 0.0
+        first_downbeat_t = detect_first_kick(bass, sr, beat_times, beat_positions)
 
     beat_confidences = compute_beat_confidence(beat_times, global_bpm)
 
@@ -522,9 +534,7 @@ def analyze_audio(
     kick_density, kick_bar_info = compute_kick_density(low_band, beats_data, duration)
 
     work_zones = detect_kick_zones(kick_density, kick_bar_info, duration=duration)
-
-    # Detect musical key
-    key = detect_key(audio_path)
+    print(f"timing: bass+zones {time.monotonic() - zones_start:.1f}s", file=sys.stderr)
 
     return {
         "version": "3.0",

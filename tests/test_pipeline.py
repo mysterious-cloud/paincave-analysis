@@ -1,4 +1,5 @@
 """Deterministic pipeline tests: real decoding/encoding, stubbed expensive inference."""
+from collections import Counter
 from contextlib import redirect_stdout
 import io
 import json
@@ -6,9 +7,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -17,11 +21,27 @@ import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import analyze
+import content_hash
 import import_track
 import pcav
 
 # Supports a staged checkout while the schemas stay in the main workspace.
 import_track.SCHEMA_DIR = Path(os.environ.get("PAINCAVE_SCHEMA_DIR", Path(__file__).resolve().parents[2] / "paincave/shared/schemas"))
+
+
+# The CLI in a child process, stalled inside analysis (stage populated) in a grandchild that records its pid.
+STALLED_IMPORT = """
+import subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+src, schemas, marker, *argv = sys.argv[1:]
+sys.path.insert(0, src)
+import analyze, import_track
+import_track.SCHEMA_DIR = Path(schemas)
+stall = lambda *a, **k: subprocess.run(['/bin/sh', '-c', 'echo $$ > "$0.tmp" && mv "$0.tmp" "$0" && exec sleep 60', marker], stderr=subprocess.DEVNULL)
+with patch.object(analyze, 'extract_beats', side_effect=stall), patch.object(sys, 'argv', ['import_track.py', *argv]):
+    import_track.main()
+"""
 
 
 def detected(*args, **kwargs):
@@ -123,7 +143,7 @@ class AnalyzerTests(unittest.TestCase):
             with self.assertRaises(ValueError): analyze.compute_tempo_curve(beats)
 
     def test_energy_covers_final_second_and_complete_bar(self):
-        self.assertEqual(len(analyze.compute_band_energy(np.ones(48001), 48000)), 2)
+        self.assertEqual(len(analyze.compute_band_energy(analyze.band_pass(np.ones(48001), 48000), 48000)), 2)
         beats = [{'t': 0, 'bar': 1, 'beat': 1}, {'t': 2, 'bar': 2, 'beat': 1}]
         density, info = analyze.compute_kick_density(np.array([0., 1., 0.]), beats, 3)
         self.assertEqual(list(density), [0.5, 0])
@@ -377,7 +397,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(list(self.library.iterdir()), [])
         h = self.run_import()
         old = self.snapshot(self.library / h)
-        for function in ('analyze_audio', 'write_pcav_file', 'convert_to_m4a', 'probe_audio', 'measure_loudness'):
+        for function in ('analyze_audio', 'write_pcav_file', 'finish_m4a_encode', 'probe_audio'):
             with patch.object(import_track, function, side_effect=RuntimeError('injected')):
                 with self.assertRaises(RuntimeError): self.run_import(force=True)
             self.assertEqual(self.snapshot(self.library / h), old)
@@ -396,14 +416,121 @@ class PipelineTests(unittest.TestCase):
         self.assertNothingPublished()
         with self.assertRaisesRegex(ValueError, 'BPM bounds'): self.run_import(min_bpm=180, max_bpm=100)
 
-    def test_short_silence_and_44100(self):
-        for rate, frames in ((44100, 441000), (48000, 12000)):
-            sf.write(self.source, np.zeros(frames), rate)
-            h = self.run_import()
-            parsed = pcav.read_pcav_file(self.library / h / 'analysis.pcav')
-            self.assertEqual(parsed.beats.beat_times, [])
-            self.assertEqual(parsed.analysis.bpm, 0)
-            self.assertEqual(parsed.peaks.sample_rate, rate)
+    def test_refuses_short_silent_and_gridless_audio(self):
+        with patch.object(analyze, 'extract_beats', return_value=(np.arange(7) * .5, np.arange(7) % 4 + 1)), \
+                self.assertRaisesRegex(analyze.NoBeatGrid, '^no beat grid: 7 beats detected'):
+            self.run_import()
+        self.assertEqual(list(self.library.iterdir()), [])
+        # Too short or silent: refused from the input decode, before anything is staged.
+        for samples, rate, message in ((np.zeros(441000), 44100, 'audio is digital silence'), (np.sin(np.arange(12000) * .01), 48000, 'audio is 0.250 s long')):
+            sf.write(self.source, samples, rate)
+            with self.subTest(message=message), patch.object(import_track, 'staging_directory', side_effect=AssertionError('staged')), \
+                    self.assertRaisesRegex(analyze.NoBeatGrid, message):
+                self.run_import()
+        with self.assertRaises(SystemExit) as refused: self.cli(self.source)
+        self.assertEqual(refused.exception.code, 'Error: refused Original song.wav: audio is 0.250 s long; at least 1 s required; nothing written')
+        self.assertEqual(list(self.library.iterdir()), [])
+        sf.write(self.source, np.sin(np.arange(441000) * .01) * .3, 44100)
+        self.assertEqual(pcav.read_pcav_file(self.library / self.run_import() / 'analysis.pcav').peaks.sample_rate, 44100)
+
+    def test_each_input_decoded_filtered_and_checksummed_once(self):
+        # Repeated decodes, filters, checksums and a separate loudness pass made imports ~20% slower.
+        encoded = self.root / 'download.m4a'
+        import_track.convert_to_m4a(self.source, encoded)
+        decode = content_hash.load_audio_samples
+        # A WAV's one decode serves identity and analysis; a compressed input is also re-decoded when staged, then its master read.
+        for audio, decodes in ((self.source, 1), (encoded, 3)):
+            with self.subTest(audio=audio.name), \
+                    patch.object(content_hash, 'load_audio_samples', wraps=decode) as hash_decodes, \
+                    patch.object(analyze, 'load_audio_samples', wraps=decode) as analysis_decodes, \
+                    patch.object(analyze, 'band_pass', wraps=analyze.band_pass) as band_pass, \
+                    patch.object(import_track, 'sha256_file', wraps=import_track.sha256_file) as sha256, \
+                    patch.object(subprocess, 'run', wraps=subprocess.run) as run, \
+                    patch.object(subprocess, 'Popen', wraps=subprocess.Popen) as popen:
+                import_track.import_song(audio, self.root / audio.suffix)
+                self.assertEqual(hash_decodes.call_count + analysis_decodes.call_count, decodes)
+                self.assertEqual(band_pass.call_count, 1)
+                self.assertEqual(max(Counter(c.args[0] for c in sha256.call_args_list).values()), 1)
+                # One madmom decode (its own ffmpeg resample to 44.1 kHz) feeds both models; one ffmpeg pass over the
+                # master encodes AAC and measures loudness (started with Popen so it overlaps analysis).
+                self.assertIs(analyze.extract_beats.call_args.args[0], analyze.detect_key.call_args.args[0])
+                spawned = [c.args[0] for c in run.call_args_list + popen.call_args_list]
+                masters = [argv for argv in spawned if '-i' in argv and Path(argv[argv.index('-i') + 1]).name == 'original.wav']
+                encodes = [argv for argv in masters if 'aac' in argv]
+                self.assertEqual(len(masters), 2, masters)
+                self.assertEqual(len(encodes), 1)
+                self.assertIn('ebur128=peak=true:framelog=quiet', encodes[0])
+
+    def test_input_changed_after_decode_is_refused(self):
+        encoded, altered_wav, altered_m4a = self.root / 'download.m4a', self.root / 'altered.wav', self.root / 'altered.m4a'
+        import_track.convert_to_m4a(self.source, encoded)
+        samples, rate = sf.read(self.source)
+        sf.write(altered_wav, samples * .5, rate, subtype='PCM_24')
+        import_track.convert_to_m4a(altered_wav, altered_m4a)
+        for audio, replacement in ((self.source, altered_wav), (encoded, altered_m4a)):
+            # The file changes after its identity was decoded and before it is staged.
+            with self.subTest(audio=audio.name), \
+                    patch.object(import_track, 'require_sound', side_effect=lambda *_, src=replacement, dst=audio: shutil.copyfile(src, dst)), \
+                    self.assertRaisesRegex(ValueError, 'Input changed during import'):
+                import_track.import_song(audio, self.library)
+            self.assertEqual(list(self.library.iterdir()), [])
+
+    def stalled_import(self):
+        """Start the CLI in its own session; return it and its grandchild's pid once analysis has stalled in the stage."""
+        marker = self.root / f'stalled-{time.monotonic_ns()}.pid'
+        proc = subprocess.Popen([sys.executable, '-c', STALLED_IMPORT, str(Path(import_track.__file__).parent), str(import_track.SCHEMA_DIR),
+                                 str(marker), str(self.source), '--library', str(self.library)],
+                                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL))
+        deadline = time.monotonic() + 60
+        while not marker.exists():
+            if proc.poll() is not None or time.monotonic() > deadline:
+                os.killpg(proc.pid, signal.SIGKILL)
+                self.fail(proc.communicate()[1].decode())
+            time.sleep(.05)
+        return proc, int(marker.read_text())
+
+    def test_sigterm_removes_stage_and_children(self):
+        # The server's timeout signals the process group and uv forwards more; repeats must not interrupt cleanup.
+        for group in (False, True):
+            proc, child = self.stalled_import()
+            self.assertEqual(len(list(self.library.glob('.staging-*'))), 1)
+            if group: os.killpg(proc.pid, signal.SIGTERM)
+            os.kill(proc.pid, signal.SIGTERM)
+            while group and proc.poll() is None:
+                os.kill(proc.pid, signal.SIGTERM)
+                time.sleep(.0005)
+            self.assertEqual(proc.wait(30), 128 + signal.SIGTERM, proc.stderr.read().decode())
+            self.assertEqual(list(self.library.iterdir()), [])
+            with self.assertRaises(ProcessLookupError): os.kill(child, 0)
+
+    def test_stale_stages_from_killed_imports_swept_live_ones_kept(self):
+        aged = lambda path: os.utime(path, (time.time() - 3600,) * 2, follow_symlinks=False) or path
+        dead, _ = self.stalled_import()
+        os.killpg(dead.pid, signal.SIGKILL)
+        dead.wait(30)
+        [leftover] = self.library.glob('.staging-*')
+        aged(leftover)
+        live, _ = self.stalled_import()  # its sweep removes the leftover
+        [stage] = self.library.glob('.staging-*')
+        self.assertNotEqual(stage, leftover)
+        # Only unlocked, aged, real staging directories go: never a live stage, a fresh one, a symlink, a track or a candidate.
+        h = self.run_import()
+        decoy = self.root / 'decoy'; decoy.mkdir(); (decoy / 'keep').write_text('keep')
+        (self.library / '.staging-0123456789ab-symlink1').symlink_to(decoy, target_is_directory=True)
+        (self.library / '.staging-0123456789ab-fresh123').mkdir()
+        (self.library / '.staging-other').mkdir()
+        (self.library / h / 'analyses/.staging-0123456789ab-candidat').mkdir(parents=True)
+        for path in (stage, self.library / '.staging-0123456789ab-symlink1', self.library / '.staging-other', self.library / h / 'analyses/.staging-0123456789ab-candidat'):
+            aged(path)
+        kept = sorted(self.library.rglob('*'))
+        with patch.object(analyze, 'extract_beats', side_effect=zoned):
+            import_track.import_song(self.library / h / 'original.wav', self.library, force=True)
+        self.assertEqual([p for p in kept if not p.exists()], [])
+        self.assertEqual((decoy / 'keep').read_text(), 'keep')
+        os.kill(live.pid, signal.SIGTERM)
+        self.assertEqual(live.wait(30), 128 + signal.SIGTERM)
+        self.assertFalse(stage.exists())
 
     def test_derived_source_provenance_survives_reanalysis(self):
         derived = self.root / 'processed.wav'
@@ -442,7 +569,7 @@ class PipelineTests(unittest.TestCase):
         h = self.run_import()
         folder = self.library / h
         old = self.snapshot(folder)
-        with patch.object(import_track, 'compute_content_hash', return_value=h + 'f' * 20):
+        with patch.object(import_track, 'fingerprint', return_value=h + 'f' * 20):
             with self.assertRaisesRegex(ValueError, 'Hash collision'): self.run_import(force=True)
         self.assertEqual(self.snapshot(folder), old)
         alternate = self.root / 'alternate'; alternate.mkdir()

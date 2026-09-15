@@ -14,24 +14,30 @@ Pipeline:
 """
 
 import argparse
+import contextlib
+import fcntl
+import functools
 import json
 import hashlib
 import math
 import tempfile
 import importlib.metadata
+import numpy as np
 import soundfile as sf
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import jsonschema
 
-from analyze import analyze_audio, load_audio
-from content_hash import compute_content_hash
+from analyze import NoBeatGrid, analyze_audio, load_audio, require_sound
+from content_hash import compute_content_hash, fingerprint
 from pcav import (
     PCAVData, AnalysisSection, BeatsSection,
     write_pcav_file, build_peak_mipmaps,
@@ -121,15 +127,47 @@ def convert_to_wav(audio_path: Path, output_path: Path) -> None:
         raise RuntimeError(f"ffmpeg conversion to WAV failed: {result.stderr}")
 
 
-def convert_to_m4a(audio_path: Path, output_path: Path) -> None:
-    """Convert audio to M4A (AAC) for streaming."""
-    result = subprocess.run(
-        ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path),
-         '-map', '0:a:0', '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', str(output_path)],
-        capture_output=True, text=True
+def start_m4a_encode(audio_path: Path, output_path: Path) -> subprocess.Popen:
+    """Start the M4A (AAC) streaming encode; the same decode feeds an EBU R128 loudness measurement.
+
+    Runs alongside analysis. Collect with `finish_m4a_encode`; kill on unwind.
+    """
+    return subprocess.Popen(
+        ['ffmpeg', '-nostdin', '-hide_banner', '-nostats', '-y', '-i', str(audio_path),
+         '-map', '0:a:0', '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', str(output_path),
+         '-map', '0:a:0', '-af', 'ebur128=peak=true:framelog=quiet', '-f', 'null', '-'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg conversion to M4A failed: {result.stderr}")
+
+
+def finish_m4a_encode(encode: subprocess.Popen) -> dict:
+    """Wait for `start_m4a_encode` and return the loudness measurement."""
+    _, stderr = encode.communicate()
+    if encode.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion to M4A failed: {stderr}")
+    summary = stderr[stderr.rindex("Summary:"):]
+    def measured(label, unit):
+        value = float(re.search(rf"{label}:\s+(\S+) {unit}", summary).group(1))
+        return value if math.isfinite(value) else None
+    return {"integratedLufs": measured("I", "LUFS"), "truePeakDbtp": measured("Peak", "dBFS"),
+            "loudnessRangeLu": measured("LRA", "LU"), "normalizationApplied": False}
+
+
+def convert_to_m4a(audio_path: Path, output_path: Path) -> dict:
+    """Encode to M4A and measure loudness, waiting for the result."""
+    return finish_m4a_encode(start_m4a_encode(audio_path, output_path))
+
+
+@contextlib.contextmanager
+def background_encode(audio_path: Path, output_path: Path):
+    """An encode running alongside analysis; killed if the block unwinds before it is collected."""
+    encode = start_m4a_encode(audio_path, output_path)
+    try:
+        yield encode
+    finally:
+        if encode.poll() is None:
+            encode.kill()
+            encode.wait()
 
 
 def sha256_file(path: Path) -> str:
@@ -156,18 +194,66 @@ def probe_audio(path: Path) -> dict:
     return {key: stream.get(key) for key in ("codec_name", "sample_rate", "channels", "duration", "start_time", "time_base", "bit_rate")}
 
 
-def measure_loudness(path: Path) -> dict:
-    result = subprocess.run(
-        ['ffmpeg', '-nostdin', '-hide_banner', '-i', str(path), '-map', '0:a:0',
-         '-af', 'loudnorm=print_format=json', '-f', 'null', '-'],
-        capture_output=True, text=True, check=True,
-    )
-    report, _ = json.JSONDecoder().raw_decode(result.stderr[result.stderr.rfind('{'):])
-    def measured(name):
-        value = float(report[name])
-        return value if math.isfinite(value) else None
-    return {"integratedLufs": measured("input_i"), "truePeakDbtp": measured("input_tp"),
-            "loudnessRangeLu": measured("input_lra"), "normalizationApplied": False}
+@contextlib.contextmanager
+def timed_stage(name: str):
+    """Print `timing: <name> <seconds>s` to stderr for a block of work."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"timing: {name} {time.monotonic() - start:.1f}s", file=sys.stderr)
+
+
+STAGING_NAME = re.compile(r"\.staging-[0-9a-f]{12}-[a-z0-9_]{8}")
+
+
+def sweep_stale_staging(library_dir: Path, min_age: float = 60) -> None:
+    """Remove staging directories whose importer died (SIGKILL, power loss).
+
+    A live import holds an flock on its staging directory; the kernel drops it when the process dies.
+    The age check covers the instant between creating a directory and locking it.
+    """
+    for entry in library_dir.iterdir():
+        if not STAGING_NAME.fullmatch(entry.name):
+            continue
+        try:
+            fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:  # a symlink, a file, or already removed
+            continue
+        try:
+            stat = os.fstat(fd)
+            if stat.st_uid != os.getuid() or time.time() - stat.st_mtime < min_age:
+                continue
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            continue
+        else:
+            print(f"Removing stale staging directory: {entry}")
+            shutil.rmtree(entry, ignore_errors=True)
+        finally:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def staging_directory(library_dir: Path, content_hash: str):
+    """A private directory in the library, locked while in use and removed on exit."""
+    sweep_stale_staging(library_dir)
+    tmp = tempfile.TemporaryDirectory(prefix=f".staging-{content_hash}-", dir=library_dir)
+    lock = os.open(tmp.name, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with tmp:
+            yield Path(tmp.name)
+    finally:
+        os.close(lock)  # after removal, so a sweep never sees this directory unlocked
+
+
+def decode_input(audio_path: Path) -> tuple[np.ndarray, int, str | None]:
+    """Decode the input once. A WAV is decoded from a single read whose SHA-256 later proves its staged copy holds these samples."""
+    if audio_path.suffix.lower() != '.wav':
+        return *load_audio(audio_path), None
+    data = audio_path.read_bytes()
+    return *load_audio(audio_path, data), hashlib.sha256(data).hexdigest()
 
 
 def enclosing_track_dir(path: Path, library_dir: Path) -> str | None:
@@ -201,13 +287,17 @@ def import_song(
     Existing active artifacts and authored data are never replaced. Revisions are
     candidates for review, not automatic changes to the grid used by saved plans.
     """
+    total_start = time.monotonic()
     audio_path = audio_path.resolve(strict=True)
     explicit_source = source_file is not None
     source_file = (source_file or audio_path).resolve(strict=True)
     library_dir = library_dir.resolve()
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
-    input_hash = compute_content_hash(audio_path, truncate=32)
+    with timed_stage("decode"):
+        samples, sample_rate, input_sha256 = decode_input(audio_path)
+    require_sound(samples, sample_rate)  # refused before identity checks and staging
+    input_hash = fingerprint(samples, truncate=32)
     full_hash = input_hash
     # Audio anywhere inside a track folder (master, candidate, rendition, copy) must prove that track's
     # identity; it never mints a second active track. Other library folders (e.g. import/) hold plain inputs.
@@ -219,7 +309,7 @@ def import_song(
             full_hash = previous["audioFingerprint"]["md5"]
             if full_hash[:12] != track_dir:
                 raise ValueError("Manifest identity does not match track directory")
-            if previous["master"]["sha256"] != sha256_file(audio_path) and input_hash != full_hash:
+            if previous["master"]["sha256"] != (input_sha256 or sha256_file(audio_path)) and input_hash != full_hash:
                 raise ValueError(f"Retained master checksum mismatch: {audio_path} is inside track {track_dir} but matches "
                                  f"neither its master SHA-256 nor its audio fingerprint; nothing written")
         elif input_hash[:12] != track_dir:
@@ -262,9 +352,10 @@ def import_song(
             raise ValueError("Retained source checksum mismatch")
     library_dir.mkdir(parents=True, exist_ok=True)
     # Same filesystem: promotion is one directory rename, never per-file replacement.
-    with tempfile.TemporaryDirectory(prefix=f".staging-{content_hash}-", dir=library_dir) as tmp:
-        stage = Path(tmp) / "track"
+    with staging_directory(library_dir, content_hash) as tmp:
+        stage = tmp / "track"
         stage.mkdir()
+        sha = functools.cache(sha256_file)  # staged files are private to this run: hash each once
         retained_source = stage / ("source" + source_file.suffix.lower())
         shutil.copy2(source_file, retained_source)
         original_wav = stage / "original.wav"
@@ -278,93 +369,99 @@ def import_song(
                 shutil.copy2(audio_path, captured_input)
             convert_to_wav(captured_input, original_wav)
         # Detect a moving input before deriving an identity from different bytes.
-        if sha256_file(source_file) != sha256_file(retained_source):
+        if sha256_file(source_file) != sha(retained_source):
             raise ValueError("Source changed during import")
-        if compute_content_hash(captured_input, truncate=32) != input_hash:
+        if (sha(captured_input) != input_sha256 if input_sha256 else compute_content_hash(captured_input, truncate=32) != input_hash):
             raise ValueError("Input changed during import")
         processing = previous_manifest_data.get("processing") if previous_manifest_data and not explicit_source else None
         if processing_record:
             processing = json.loads(processing_record.read_text())
         if processing is not None:
-            if processing.get("inputSha256") != sha256_file(retained_source) or processing.get("outputSha256") != sha256_file(original_wav):
+            if processing.get("inputSha256") != sha(retained_source) or processing.get("outputSha256") != sha(original_wav):
                 raise ValueError("Processing provenance does not match source and derived master")
         elif explicit_source and source_file != audio_path:
             raise ValueError("A derived master requires --processing-record provenance")
 
-        analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat)
-        validate_json(analysis, "analysis")
-        samples, sample_rate = load_audio(original_wav)
-        info = sf.info(original_wav)
-        if analysis["duration"] != info.frames / info.samplerate or analysis["sampleRate"] != sample_rate:
-            raise ValueError("Analysis timebase does not match the retained master")
-        bar_starts = {b["bar"]: b["t"] for b in analysis["beats"] if b["bar"] > 0 and b["beat"] == 1}
-        for zone in analysis["workZones"]:
-            start_bar = zone["startBar"]
-            next_bar = start_bar + zone["durationBars"]
-            if start_bar not in bar_starts or next_bar > max(bar_starts) + 1:
-                raise ValueError("Work zone lies outside the measured bar grid")
-            start = bar_starts[start_bar]
-            end = bar_starts.get(next_bar, analysis["duration"])
-            if abs(zone["startSeconds"] - start) > .006 or abs(zone["durationSeconds"] - (end - start)) > .006:
-                raise ValueError("Work zone times disagree with the measured grid")
-        beat_times = analysis["raw"]["beatTimes"]
-        first_idx = min(range(len(beat_times)), key=lambda i: abs(beat_times[i] - analysis["firstDownbeat"])) if beat_times else None
-        levels = build_peak_mipmaps(samples, sample_rate)
-        pcav_data = PCAVData(
-            analysis=AnalysisSection(duration_seconds=info.frames / info.samplerate, bpm=analysis["bpm"], key=analysis.get("key")),
-            beats=BeatsSection(beat_times, first_idx, 4), peaks=levels[0], overview_peaks=levels[1],
-        )
-        write_pcav_file(stage / "analysis.pcav", pcav_data)
-        from pcav import read_pcav_file
-        read_pcav_file(stage / "analysis.pcav")
-        write_json(stage / "analysis.json", analysis)
-        write_json(stage / "plan_workzones.json", {"version": 1, "zones": analysis["workZones"]})
-        suno_meta = extract_suno_metadata(retained_source)
-        existing_meta = json.loads((song_dir / "metadata.json").read_text()) if existing and (song_dir / "metadata.json").is_file() else {}
-        metadata = {
-            "hash": content_hash,
-            "title": title if title is not None else existing_meta.get("title", source_file.stem),
-            "artist": artist if artist is not None else existing_meta.get("artist", "Pain Cave"),
-            "source": source,
-            "sourceId": source_id or suno_meta.get("id") or existing_meta.get("sourceId", ""),
-            "genres": genres if genres is not None else existing_meta.get("genres", []),
-            "bpm": analysis["bpm"], "durationSeconds": int(round(info.frames / info.samplerate)), "key": analysis.get("key"),
-            "createdAt": suno_meta.get("created") or get_file_created_time(retained_source),
-            "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        validate_json(metadata, "metadata")
-        write_json(stage / "metadata.json", metadata)
-        convert_to_m4a(original_wav, stage / "audio.m4a")
-        playback = probe_audio(stage / "audio.m4a")
-        if abs(float(playback["duration"]) - info.frames / info.samplerate) > 0.05:
-            raise ValueError("Playback duration differs from analyzed master by more than 50 ms")
-        versions = {}
-        for package in ("numpy", "scipy", "soundfile", "madmom"):
-            try:
-                versions[package] = importlib.metadata.version(package)
-            except importlib.metadata.PackageNotFoundError:
-                versions[package] = None
-        versions["ffmpeg"] = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
-        manifest = {
-            "version": 1, "pcavVersion": 2,
-            "audioFingerprint": {"algorithm": "legacy-mono-float32-md5", "md5": full_hash},
-            "source": {"file": retained_source.name, "name": previous_manifest_data["source"]["name"] if previous_manifest_data and not explicit_source else source_file.name, "sha256": sha256_file(retained_source)},
-            "master": {"file": "original.wav", "sha256": sha256_file(original_wav), "frames": info.frames,
-                       "sampleRate": sample_rate, "channels": info.channels, "subtype": info.subtype, "duration": info.frames / info.samplerate},
-            "processing": processing, "playback": playback,
-            "loudness": measure_loudness(original_wav),
-            "grid": {"firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
-                     "beatCount": len(beat_times), "firstBeat": beat_times[0] if beat_times else None,
-                     "lastBeat": beat_times[-1] if beat_times else None,
-                     "confidenceKind": "interval-regularity" if beat_times else "unknown",
-                     "meanIntervalConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times) if beat_times else None},
-            "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat, "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k"},
-            "tools": versions,
-            "toolSources": {name: sha256_file(Path(__file__).parent / name) for name in ("analyze.py", "pcav.py", "import_track.py", "content_hash.py")},
-            "artifacts": {p.name: {"sha256": sha256_file(p), "bytes": p.stat().st_size} for p in sorted(stage.iterdir())},
-        }
-        write_json(stage / "manifest.json", manifest)
-        revision = sha256_file(stage / "manifest.json")
+        # The streaming encode runs on its own core while madmom works; collected before the manifest.
+        with background_encode(original_wav, stage / "audio.m4a") as encode:
+            if captured_input != original_wav:  # the decoded input was compressed; analysis reads the master
+                samples, sample_rate = load_audio(original_wav)
+            analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat, audio=(samples, sample_rate))
+            validate_json(analysis, "analysis")
+            info = sf.info(original_wav)
+            if analysis["duration"] != info.frames / info.samplerate or analysis["sampleRate"] != sample_rate:
+                raise ValueError("Analysis timebase does not match the retained master")
+            bar_starts = {b["bar"]: b["t"] for b in analysis["beats"] if b["bar"] > 0 and b["beat"] == 1}
+            for zone in analysis["workZones"]:
+                start_bar = zone["startBar"]
+                next_bar = start_bar + zone["durationBars"]
+                if start_bar not in bar_starts or next_bar > max(bar_starts) + 1:
+                    raise ValueError("Work zone lies outside the measured bar grid")
+                start = bar_starts[start_bar]
+                end = bar_starts.get(next_bar, analysis["duration"])
+                if abs(zone["startSeconds"] - start) > .006 or abs(zone["durationSeconds"] - (end - start)) > .006:
+                    raise ValueError("Work zone times disagree with the measured grid")
+            beat_times = analysis["raw"]["beatTimes"]
+            first_idx = min(range(len(beat_times)), key=lambda i: abs(beat_times[i] - analysis["firstDownbeat"]))
+            with timed_stage("peaks"):
+                levels = build_peak_mipmaps(samples, sample_rate)
+            pcav_data = PCAVData(
+                analysis=AnalysisSection(duration_seconds=info.frames / info.samplerate, bpm=analysis["bpm"], key=analysis.get("key")),
+                beats=BeatsSection(beat_times, first_idx, 4), peaks=levels[0], overview_peaks=levels[1],
+            )
+            write_pcav_file(stage / "analysis.pcav", pcav_data)
+            from pcav import read_pcav_file
+            read_pcav_file(stage / "analysis.pcav")
+            write_json(stage / "analysis.json", analysis)
+            write_json(stage / "plan_workzones.json", {"version": 1, "zones": analysis["workZones"]})
+            suno_meta = extract_suno_metadata(retained_source)
+            existing_meta = json.loads((song_dir / "metadata.json").read_text()) if existing and (song_dir / "metadata.json").is_file() else {}
+            metadata = {
+                "hash": content_hash,
+                "title": title if title is not None else existing_meta.get("title", source_file.stem),
+                "artist": artist if artist is not None else existing_meta.get("artist", "Pain Cave"),
+                "source": source,
+                "sourceId": source_id or suno_meta.get("id") or existing_meta.get("sourceId", ""),
+                "genres": genres if genres is not None else existing_meta.get("genres", []),
+                "bpm": analysis["bpm"], "durationSeconds": int(round(info.frames / info.samplerate)), "key": analysis.get("key"),
+                "createdAt": suno_meta.get("created") or get_file_created_time(retained_source),
+                "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            validate_json(metadata, "metadata")
+            write_json(stage / "metadata.json", metadata)
+            with timed_stage("aac+loudness"):  # wait for the encode started before analysis
+                loudness = finish_m4a_encode(encode)
+            playback = probe_audio(stage / "audio.m4a")
+            if abs(float(playback["duration"]) - info.frames / info.samplerate) > 0.05:
+                raise ValueError("Playback duration differs from analyzed master by more than 50 ms")
+            versions = {}
+            for package in ("numpy", "scipy", "soundfile", "madmom"):
+                try:
+                    versions[package] = importlib.metadata.version(package)
+                except importlib.metadata.PackageNotFoundError:
+                    versions[package] = None
+            versions["ffmpeg"] = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
+            with timed_stage("checksums"):
+                manifest = {
+                    "version": 1, "pcavVersion": 2,
+                    "audioFingerprint": {"algorithm": "legacy-mono-float32-md5", "md5": full_hash},
+                    "source": {"file": retained_source.name, "name": previous_manifest_data["source"]["name"] if previous_manifest_data and not explicit_source else source_file.name, "sha256": sha(retained_source)},
+                    "master": {"file": "original.wav", "sha256": sha(original_wav), "frames": info.frames,
+                               "sampleRate": sample_rate, "channels": info.channels, "subtype": info.subtype, "duration": info.frames / info.samplerate},
+                    "processing": processing, "playback": playback,
+                    "loudness": loudness,
+                    "grid": {"firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
+                             "beatCount": len(beat_times), "firstBeat": beat_times[0], "lastBeat": beat_times[-1],
+                             "confidenceKind": "interval-regularity",
+                             "meanIntervalConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times)},
+                    "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat, "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
+                               "loudnessFilter": "ebur128=peak=true"},
+                    "tools": versions,
+                    "toolSources": {name: sha256_file(Path(__file__).parent / name) for name in ("analyze.py", "pcav.py", "import_track.py", "content_hash.py")},
+                    "artifacts": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in sorted(stage.iterdir())},
+                }
+            write_json(stage / "manifest.json", manifest)
+            revision = sha256_file(stage / "manifest.json")
         if existing:
             revisions = song_dir / "analyses"
             if revisions.is_symlink():
@@ -380,6 +477,7 @@ def import_song(
         print(f"Done: {destination}")
         if existing:
             print(f"Revision: {destination} (candidate; active files and authored edits unchanged)")
+    print(f"timing: total {time.monotonic() - total_start:.1f}s", file=sys.stderr)
     return content_hash
 
 
@@ -411,21 +509,31 @@ def main():
 
     genres = [g.strip() for g in args.genres.split(",") if g.strip()] if args.genres else None
 
-    content_hash = import_song(
-        audio_path=args.audio_file.resolve(),
-        library_dir=args.library.resolve(),
-        title=args.title,
-        artist=args.artist,
-        source=args.source,
-        source_id=args.source_id,
-        genres=genres,
-        min_bpm=args.min_bpm,
-        max_bpm=args.max_bpm,
-        force=args.force,
-        source_file=args.source_file,
-        processing_record=args.processing_record,
-        first_downbeat=args.first_downbeat,
-    )
+    def terminate(signum, _frame):
+        # One-shot (a group signal and uv's forwarded copy can both arrive) and no I/O: a failed write would
+        # replace SystemExit with an Exception that `except Exception` blocks swallow. Unwinding removes the stage.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
+
+    try:
+        content_hash = import_song(
+            audio_path=args.audio_file.resolve(),
+            library_dir=args.library.resolve(),
+            title=args.title,
+            artist=args.artist,
+            source=args.source,
+            source_id=args.source_id,
+            genres=genres,
+            min_bpm=args.min_bpm,
+            max_bpm=args.max_bpm,
+            force=args.force,
+            source_file=args.source_file,
+            processing_record=args.processing_record,
+            first_downbeat=args.first_downbeat,
+        )
+    except NoBeatGrid as e:
+        raise SystemExit(f"Error: refused {args.audio_file.name}: {e}; nothing written")
 
     print(f"\nHash: {content_hash}")
 

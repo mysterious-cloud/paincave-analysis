@@ -4,7 +4,11 @@ What `src/import_track.py` (via `bin/import` or `../paincave/bin/analyze.sh`) wr
 
 ## Track directory and promotion
 
-New imports are built in a unique `.staging-*` directory inside the requested library. Metadata/analysis validation, PCAV round-trip, AAC probing, loudness measurement and checksum collection must all succeed before one same-filesystem directory rename exposes the track. Exceptions clean only that run's staging directory; a killed process (SIGKILL, power loss) leaves it behind and nothing removes it. A pre-existing partial track is reported as incomplete, not successful.
+New imports are built in a unique `.staging-*` directory inside the requested library. Metadata/analysis validation, PCAV round-trip, AAC probing, loudness measurement and checksum collection must all succeed before one same-filesystem directory rename exposes the track. Exceptions clean only that run's staging directory. SIGTERM (e.g. the server's analyze timeout) exits with status 143 after the same cleanup; the handler fires once, and ffmpeg children are killed while unwinding. Signal delivery waits for a running C call (up to ~5.5 s measured on a 29-minute track), so callers should allow a grace period before SIGKILL. A live import holds an `flock` on its staging directory; SIGKILL or power loss leaves the directory behind unlocked, and the next import into that library removes every `.staging-<hash>-<8 chars>` directory in the library root that is unlocked, owned by the user, not a symlink and more than 60 s old. Track folders and candidates are never scanned. A pre-existing partial track is reported as incomplete, not successful.
+
+### Refused input
+
+Input under 1 second or digital silence is refused straight after the input is decoded, before identity checks or staging. Input with fewer than 8 beats (two bars) between `--min-bpm` and `--max-bpm` is refused after beat tracking on the staged master, before any artifact is written; the stage is removed. The CLI exits 1 with one stderr line, `Error: refused <file>: <reason>; nothing written`; `import_song` raises `analyze.NoBeatGrid`. madmom invents a grid for steady tones and noise (21–24 beats on 10 s inputs), so this gate does not reject non-music.
 
 ```text
 {library}/{hash}/
@@ -32,11 +36,11 @@ SQL owns authored edits. These files seed a new catalog entry; this tool does no
 - `.wav` input: byte copy (`shutil.copy2`); sample rate, bit depth and channels are unchanged.
 - Other input: ffmpeg decodes the first audio stream to float32 PCM WAV at its native rate/channels. The exact compressed source is retained separately.
 
-Beat, key, peak and work-zone analysis read the retained `original.wav`. The legacy hash comes from the preparation input; SUNO tags and default title come from the retained unprocessed source. `--source-file` requires a matching `--processing-record` with source/output SHA-256 checksums for derived masters. Reanalysis carries existing source lineage forward.
+Beat, key, peak and work-zone analysis read the retained `original.wav`. A `.wav` input is decoded once, from a single read: the staged `original.wav` must match that read's SHA-256 (`Input changed during import` otherwise), so those samples serve the identity, the analysis and the peaks. Other inputs are decoded for the identity, re-decoded from the staged copy to prove it, and the master is decoded for analysis. madmom decodes the master once (44.1 kHz mono, via its own ffmpeg resample) for both the beat and key models; the beat ensemble's 8 networks run in parallel worker processes (predictions averaged in fixed order, so output is identical to a serial run) while key detection runs on a thread, and the AAC/loudness encode is started before analysis and collected before the manifest. Each stage prints `timing: <stage> <seconds>s` to stderr. Measured 2026-09-15 (M1 Max, 10 cores): 2:39 track 7.4 s, 3:44 track 9.7 s wall. The legacy hash comes from the preparation input; SUNO tags and default title come from the retained unprocessed source. `--source-file` requires a matching `--processing-record` with source/output SHA-256 checksums for derived masters. Reanalysis carries existing source lineage forward.
 
 ## audio.m4a
 
-AAC at 256 kbps, first audio stream, `+faststart`. Probe must find a positive audio duration within 50 ms of the analyzed master. The source and master are not loudness-normalized. Browser edit-list/alignment checks are recorded in the main architecture document.
+AAC at 256 kbps, first audio stream, `+faststart`. The same ffmpeg process measures loudness (`ebur128=peak=true`) from its decode of the master. Probe must find a positive audio duration within 50 ms of the analyzed master. The source and master are not loudness-normalized. Browser edit-list/alignment checks are recorded in the main architecture document.
 
 ## analysis.pcav
 
@@ -82,9 +86,9 @@ Validated against `../paincave/shared/schemas/metadata.schema.json` (`additional
 
 ## manifest.json
 
-Version 1 records source/master SHA-256 and original filename, full legacy MD5 fingerprint, exact sample count/rate/channels/subtype, playback probe properties, source processing record, detector config, peak windows/filter, AAC bitrate, dependency/ffmpeg versions, tool-source digests and per-artifact sizes/checksums. Integrated input LUFS, true peak and loudness range are measured without applying normalization; non-finite measurements (silence) are null. `normalizationApplied` is false.
+Version 1 records source/master SHA-256 and original filename, full legacy MD5 fingerprint, exact sample count/rate/channels/subtype, playback probe properties, source processing record, detector config, peak windows/filter, AAC bitrate, dependency/ffmpeg versions, tool-source digests and per-artifact sizes/checksums. Integrated input LUFS, true peak and loudness range come from ffmpeg's `ebur128` summary (0.1 precision; `config.loudnessFilter` records the filter) and are measured without applying normalization; non-finite measurements are null. `normalizationApplied` is false. Manifests written before 2026-09-15 used `loudnorm`, whose loudness range differs by up to 0.7 LU on the current tracks (integrated and true peak within 0.05).
 
-The grid records beat count/coverage, first-downbeat index, meter, `reviewed: false`, and mean **interval regularity**, which is not model/physiological confidence. Silence and inputs shorter than one second have BPM 0 and no grid; the main repo's `db:sync-tracks` rejects BPM 0 or `durationSeconds` 0 and stops. Work-zone energy covers complete bars and the final partial second. `--first-downbeat` explicitly overrides alignment by snapping to a detected beat.
+The grid records beat count/coverage, first-downbeat index, meter, `reviewed: false`, and mean **interval regularity**, which is not model/physiological confidence. Every imported track has at least 8 beats and a positive BPM (see [Refused input](#refused-input)); folders written by older versions can still hold BPM 0. Work-zone energy covers complete bars and the final partial second. `--first-downbeat` explicitly overrides alignment by snapping to a detected beat.
 
 Versioned candidates and filesystem rename protect ordinary processing failures. They are not a power-loss durability or backup guarantee. No automatic revision publication, source deletion, cloud upload, paid API or SQL sync happens here.
 

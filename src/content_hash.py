@@ -7,6 +7,7 @@ truncated to 12 characters for readability and filesystem friendliness.
 """
 
 import hashlib
+import io
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,11 +16,11 @@ import numpy as np
 import soundfile as sf
 
 
-def load_audio_samples(audio_path: Path) -> np.ndarray:
-    """Load audio file and return raw samples as a numpy array.
+def load_audio_samples(audio_path: Path, data: bytes | None = None) -> tuple[np.ndarray, int]:
+    """Decode an audio file to mono samples and their sample rate.
 
     m4a/mp3/aac are decoded by ffmpeg to 44.1 kHz; other formats are read at
-    their native sample rate. Returns mono audio.
+    their native sample rate, from `data` (the file's bytes) when given.
     """
     suffix = audio_path.suffix.lower()
 
@@ -33,15 +34,20 @@ def load_audio_samples(audio_path: Path) -> np.ndarray:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-            audio, _ = sf.read(tmp_path)
+            audio, rate = sf.read(tmp_path)
     else:
-        audio, _ = sf.read(audio_path)
+        audio, rate = sf.read(io.BytesIO(data) if data is not None else audio_path)
 
     # Convert to mono if stereo
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
-    return audio
+    return audio, rate
+
+
+def fingerprint(audio: np.ndarray, truncate: int = 12) -> str:
+    """MD5 of mono samples as float32, the definition behind every track key."""
+    return hashlib.md5(audio.astype(np.float32).tobytes()).hexdigest()[:truncate]
 
 
 def compute_content_hash(audio_path: Path, truncate: int = 12) -> str:
@@ -59,16 +65,7 @@ def compute_content_hash(audio_path: Path, truncate: int = 12) -> str:
     Returns:
         Truncated MD5 hash string (lowercase hex)
     """
-    audio = load_audio_samples(audio_path)
-
-    # Convert to bytes for hashing
-    # Use float32 to ensure consistent representation
-    audio_bytes = audio.astype(np.float32).tobytes()
-
-    # Compute MD5 hash
-    md5 = hashlib.md5(audio_bytes).hexdigest()
-
-    return md5[:truncate]
+    return fingerprint(load_audio_samples(audio_path)[0], truncate)
 
 
 def main():
