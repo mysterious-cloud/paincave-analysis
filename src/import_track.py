@@ -43,7 +43,6 @@ from pcav import (
     write_pcav_file, build_peak_mipmaps,
 )
 
-
 DEFAULT_TRACKS_DIR = Path(os.environ.get(
     "PAINCAVE_TRACKS_DIR",
     Path(__file__).resolve().parent.parent.parent / "paincave-tracks"
@@ -69,7 +68,9 @@ def validate_json(data: dict, schema_name: str) -> None:
     if schema_name == "metadata":
         for name in ("createdAt", "updatedAt"):
             value = data[name]
-            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})", value):
+            if not re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})",
+                    value):
                 raise ValueError(f"Invalid {name}: expected RFC 3339 date-time")
             datetime.fromisoformat(value.upper())
 
@@ -120,7 +121,8 @@ def get_file_created_time(path: Path) -> str:
 def convert_to_wav(audio_path: Path, output_path: Path) -> None:
     """Convert any audio to WAV for archival."""
     result = subprocess.run(
-        ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path), '-map', '0:a:0', '-c:a', 'pcm_f32le', str(output_path)],
+        ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(audio_path), '-map', '0:a:0', '-c:a', 'pcm_f32le',
+         str(output_path)],
         capture_output=True, text=True
     )
     if result.returncode != 0:
@@ -146,9 +148,11 @@ def finish_m4a_encode(encode: subprocess.Popen) -> dict:
     if encode.returncode != 0:
         raise RuntimeError(f"ffmpeg conversion to M4A failed: {stderr}")
     summary = stderr[stderr.rindex("Summary:"):]
+
     def measured(label, unit):
         value = float(re.search(rf"{label}:\s+(\S+) {unit}", summary).group(1))
         return value if math.isfinite(value) else None
+
     return {"integratedLufs": measured("I", "LUFS"), "truePeakDbtp": measured("Peak", "dBFS"),
             "loudnessRangeLu": measured("LRA", "LU"), "normalizationApplied": False}
 
@@ -191,7 +195,8 @@ def probe_audio(path: Path) -> dict:
     duration = float(stream.get("duration", 0))
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("Invalid playback duration")
-    return {key: stream.get(key) for key in ("codec_name", "sample_rate", "channels", "duration", "start_time", "time_base", "bit_rate")}
+    return {key: stream.get(key) for key in
+            ("codec_name", "sample_rate", "channels", "duration", "start_time", "time_base", "bit_rate")}
 
 
 @contextlib.contextmanager
@@ -256,6 +261,36 @@ def decode_input(audio_path: Path) -> tuple[np.ndarray, int, str | None]:
     return *load_audio(audio_path, data), hashlib.sha256(data).hexdigest()
 
 
+# Files in a track folder that analysis does not produce and a replacement must carry over.
+KEPT_ON_REPLACE = re.compile(r"thumb(_\d+)?\.(avif|webp|png|jpg)|thumbnail\.json|plans|analyses|\.thumbnail\.lock")
+
+
+def replace_active(song_dir: Path, stage: Path, tmp: Path) -> None:
+    """Swap the staged analysis in as the active track folder.
+
+    Everything the stage does not produce (thumbnails, authored plans, candidate revisions) moves into the
+    stage first, then two renames swap the folders; the old analysis is removed last. Same filesystem.
+    """
+    retired = tmp / "retired"
+    moved = []
+    try:
+        for entry in list(song_dir.iterdir()):
+            if KEPT_ON_REPLACE.fullmatch(entry.name) and not (stage / entry.name).exists():
+                entry.rename(stage / entry.name)
+                moved.append(entry.name)
+        song_dir.rename(retired)
+        try:
+            stage.rename(song_dir)
+        except OSError:
+            retired.rename(song_dir)
+            raise
+    except OSError:  # nothing lost: the old folder and its kept files come back under their names
+        for name in moved:
+            (stage / name).rename(song_dir / name)
+        raise
+    shutil.rmtree(retired)
+
+
 def enclosing_track_dir(path: Path, library_dir: Path) -> str | None:
     """Key of the library track folder containing path; directories match by identity, names case-insensitively."""
     if not library_dir.is_dir():
@@ -268,21 +303,23 @@ def enclosing_track_dir(path: Path, library_dir: Path) -> str | None:
 
 
 def import_song(
-    audio_path: Path,
-    library_dir: Path,
-    title: str | None = None,
-    artist: str | None = None,
-    source: str = "SUNO",
-    source_id: str | None = None,
-    genres: list[str] | None = None,
-    min_bpm: int = 100,
-    max_bpm: int = 180,
-    force: bool = False,
-    source_file: Path | None = None,
-    processing_record: Path | None = None,
-    first_downbeat: float | None = None,
+        audio_path: Path,
+        library_dir: Path,
+        title: str | None = None,
+        artist: str | None = None,
+        source: str = "SUNO",
+        source_id: str | None = None,
+        genres: list[str] | None = None,
+        min_bpm: int = 100,
+        max_bpm: int = 180,
+        force: bool = False,
+        replace: bool = False,
+        source_file: Path | None = None,
+        processing_record: Path | None = None,
+        first_downbeat: float | None = None,
 ) -> str:
-    """Atomically import a new track, or retain a new analysis revision with --force.
+    """Atomically import a new track, retain a new analysis revision with --force, or replace the active
+    analysis with --replace.
 
     Existing active artifacts and authored data are never replaced. Revisions are
     candidates for review, not automatic changes to the grid used by saved plans.
@@ -310,8 +347,9 @@ def import_song(
             if full_hash[:12] != track_dir:
                 raise ValueError("Manifest identity does not match track directory")
             if previous["master"]["sha256"] != (input_sha256 or sha256_file(audio_path)) and input_hash != full_hash:
-                raise ValueError(f"Retained master checksum mismatch: {audio_path} is inside track {track_dir} but matches "
-                                 f"neither its master SHA-256 nor its audio fingerprint; nothing written")
+                raise ValueError(
+                    f"Retained master checksum mismatch: {audio_path} is inside track {track_dir} but matches "
+                    f"neither its master SHA-256 nor its audio fingerprint; nothing written")
         elif input_hash[:12] != track_dir:
             raise ValueError(f"Unverifiable legacy identity: {audio_path} hashes to {input_hash[:12]}, not its track "
                              f"directory {track_dir}, and no manifest.json proves identity; nothing written")
@@ -336,10 +374,13 @@ def import_song(
             raise ValueError("Incomplete existing track: retained original is missing")
         if previous_hash != full_hash:
             raise ValueError("Hash collision or unverifiable legacy input; existing track left intact")
+        if replace and not force:
+            raise ValueError("--replace requires --force")
         if not force:
             for name in ("original.wav", "analysis.pcav", "audio.m4a", "metadata.json", "plan_workzones.json"):
                 if not (song_dir / name).is_file():
-                    raise ValueError(f"Incomplete existing track: {name} missing; use --force to stage a recovery revision")
+                    raise ValueError(
+                        f"Incomplete existing track: {name} missing; use --force to stage a recovery revision")
             print(f"Track already exists: {song_dir}")
             return content_hash
 
@@ -371,13 +412,16 @@ def import_song(
         # Detect a moving input before deriving an identity from different bytes.
         if sha256_file(source_file) != sha(retained_source):
             raise ValueError("Source changed during import")
-        if (sha(captured_input) != input_sha256 if input_sha256 else compute_content_hash(captured_input, truncate=32) != input_hash):
+        if (sha(captured_input) != input_sha256 if input_sha256 else compute_content_hash(captured_input,
+                                                                                          truncate=32) != input_hash):
             raise ValueError("Input changed during import")
-        processing = previous_manifest_data.get("processing") if previous_manifest_data and not explicit_source else None
+        processing = previous_manifest_data.get(
+            "processing") if previous_manifest_data and not explicit_source else None
         if processing_record:
             processing = json.loads(processing_record.read_text())
         if processing is not None:
-            if processing.get("inputSha256") != sha(retained_source) or processing.get("outputSha256") != sha(original_wav):
+            if processing.get("inputSha256") != sha(retained_source) or processing.get("outputSha256") != sha(
+                    original_wav):
                 raise ValueError("Processing provenance does not match source and derived master")
         elif explicit_source and source_file != audio_path:
             raise ValueError("A derived master requires --processing-record provenance")
@@ -386,7 +430,8 @@ def import_song(
         with background_encode(original_wav, stage / "audio.m4a") as encode:
             if captured_input != original_wav:  # the decoded input was compressed; analysis reads the master
                 samples, sample_rate = load_audio(original_wav)
-            analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat, audio=(samples, sample_rate))
+            analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat,
+                                     audio=(samples, sample_rate))
             validate_json(analysis, "analysis")
             info = sf.info(original_wav)
             if analysis["duration"] != info.frames / info.samplerate or analysis["sampleRate"] != sample_rate:
@@ -406,7 +451,8 @@ def import_song(
             with timed_stage("peaks"):
                 levels = build_peak_mipmaps(samples, sample_rate)
             pcav_data = PCAVData(
-                analysis=AnalysisSection(duration_seconds=info.frames / info.samplerate, bpm=analysis["bpm"], key=analysis.get("key")),
+                analysis=AnalysisSection(duration_seconds=info.frames / info.samplerate, bpm=analysis["bpm"],
+                                         key=analysis.get("key")),
                 beats=BeatsSection(beat_times, first_idx, 4), peaks=levels[0], overview_peaks=levels[1],
             )
             write_pcav_file(stage / "analysis.pcav", pcav_data)
@@ -415,7 +461,8 @@ def import_song(
             write_json(stage / "analysis.json", analysis)
             write_json(stage / "plan_workzones.json", {"version": 1, "zones": analysis["workZones"]})
             suno_meta = extract_suno_metadata(retained_source)
-            existing_meta = json.loads((song_dir / "metadata.json").read_text()) if existing and (song_dir / "metadata.json").is_file() else {}
+            existing_meta = json.loads((song_dir / "metadata.json").read_text()) if existing and (
+                    song_dir / "metadata.json").is_file() else {}
             metadata = {
                 "hash": content_hash,
                 "title": title if title is not None else existing_meta.get("title", source_file.stem),
@@ -423,8 +470,10 @@ def import_song(
                 "source": source,
                 "sourceId": source_id or suno_meta.get("id") or existing_meta.get("sourceId", ""),
                 "genres": genres if genres is not None else existing_meta.get("genres", []),
-                "bpm": analysis["bpm"], "durationSeconds": int(round(info.frames / info.samplerate)), "key": analysis.get("key"),
-                "createdAt": suno_meta.get("created") or get_file_created_time(retained_source),
+                "bpm": analysis["bpm"], "durationSeconds": int(round(info.frames / info.samplerate)),
+                "key": analysis.get("key"),
+                "createdAt": suno_meta.get("created") or existing_meta.get("createdAt") or get_file_created_time(
+                    retained_source),
                 "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
             validate_json(metadata, "metadata")
@@ -440,28 +489,42 @@ def import_song(
                     versions[package] = importlib.metadata.version(package)
                 except importlib.metadata.PackageNotFoundError:
                     versions[package] = None
-            versions["ffmpeg"] = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
+            versions["ffmpeg"] = \
+                subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True).stdout.splitlines()[
+                    0]
             with timed_stage("checksums"):
                 manifest = {
                     "version": 1, "pcavVersion": 2,
                     "audioFingerprint": {"algorithm": "legacy-mono-float32-md5", "md5": full_hash},
-                    "source": {"file": retained_source.name, "name": previous_manifest_data["source"]["name"] if previous_manifest_data and not explicit_source else source_file.name, "sha256": sha(retained_source)},
+                    "source": {"file": retained_source.name, "name": previous_manifest_data["source"][
+                        "name"] if previous_manifest_data and not explicit_source else source_file.name,
+                               "sha256": sha(retained_source)},
                     "master": {"file": "original.wav", "sha256": sha(original_wav), "frames": info.frames,
-                               "sampleRate": sample_rate, "channels": info.channels, "subtype": info.subtype, "duration": info.frames / info.samplerate},
+                               "sampleRate": sample_rate, "channels": info.channels, "subtype": info.subtype,
+                               "duration": info.frames / info.samplerate},
                     "processing": processing, "playback": playback,
                     "loudness": loudness,
                     "grid": {"firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
                              "beatCount": len(beat_times), "firstBeat": beat_times[0], "lastBeat": beat_times[-1],
                              "confidenceKind": "interval-regularity",
-                             "meanIntervalConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times)},
-                    "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat, "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
+                             "meanIntervalConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(
+                                 beat_times)},
+                    "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat,
+                               "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
                                "loudnessFilter": "ebur128=peak=true"},
                     "tools": versions,
-                    "toolSources": {name: sha256_file(Path(__file__).parent / name) for name in ("analyze.py", "pcav.py", "import_track.py", "content_hash.py")},
-                    "artifacts": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in sorted(stage.iterdir())},
+                    "toolSources": {name: sha256_file(Path(__file__).parent / name) for name in
+                                    ("analyze.py", "pcav.py", "import_track.py", "content_hash.py")},
+                    "artifacts": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in
+                                  sorted(stage.iterdir())},
                 }
             write_json(stage / "manifest.json", manifest)
             revision = sha256_file(stage / "manifest.json")
+        if existing and replace:
+            replace_active(song_dir, stage, tmp)
+            print(f"Done: {song_dir}")
+            print(f"Replaced: {song_dir} (active analysis updated; thumbnails, plans and candidates kept)")
+            return content_hash
         if existing:
             revisions = song_dir / "analyses"
             if revisions.is_symlink():
@@ -496,7 +559,10 @@ def main():
     parser.add_argument("-g", "--genres", type=str, help="Comma-separated genre slugs")
     parser.add_argument("--min-bpm", type=int, default=100, help="Minimum BPM (default: 100)")
     parser.add_argument("--max-bpm", type=int, default=180, help="Maximum BPM (default: 180)")
-    parser.add_argument("-f", "--force", action="store_true", help="Stage a candidate analysis revision (write-once by convention); preserve active files")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Stage a candidate analysis revision (write-once by convention); preserve active files")
+    parser.add_argument("--replace", action="store_true",
+                        help="With --force: make the new analysis the active one (thumbnails, plans and candidates are kept)")
 
     parser.add_argument("--source-file", type=Path, help="Retain the unprocessed source download")
     parser.add_argument("--processing-record", type=Path, help="Audio preparation provenance JSON")
@@ -514,6 +580,7 @@ def main():
         # replace SystemExit with an Exception that `except Exception` blocks swallow. Unwinding removes the stage.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise SystemExit(128 + signum)
+
     signal.signal(signal.SIGTERM, terminate)
 
     try:
@@ -528,6 +595,7 @@ def main():
             min_bpm=args.min_bpm,
             max_bpm=args.max_bpm,
             force=args.force,
+            replace=args.replace,
             source_file=args.source_file,
             processing_record=args.processing_record,
             first_downbeat=args.first_downbeat,

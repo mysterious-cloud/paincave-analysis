@@ -26,8 +26,8 @@ import import_track
 import pcav
 
 # Supports a staged checkout while the schemas stay in the main workspace.
-import_track.SCHEMA_DIR = Path(os.environ.get("PAINCAVE_SCHEMA_DIR", Path(__file__).resolve().parents[2] / "paincave/shared/schemas"))
-
+import_track.SCHEMA_DIR = Path(
+    os.environ.get("PAINCAVE_SCHEMA_DIR", Path(__file__).resolve().parents[2] / "paincave/shared/schemas"))
 
 # The CLI in a child process, stalled inside analysis (stage populated) in a grandchild that records its pid.
 STALLED_IMPORT = """
@@ -59,10 +59,12 @@ def zoned(*args, **kwargs):
 
 def altered(target, change):
     """Wrap a real function and mutate its result, to inject one inconsistent value."""
+
     def run(*args, **kwargs):
         result = target(*args, **kwargs)
         change(result)
         return result
+
     return run
 
 
@@ -71,7 +73,7 @@ class PcavTests(unittest.TestCase):
         samples = np.sin(np.arange(rate * 10 + 1) * 0.03)
         peaks = pcav.build_peak_mipmaps(samples, rate)
         return pcav.PCAVData(pcav.AnalysisSection(len(samples) / rate, 123.4, None),
-            pcav.BeatsSection([0.123456 + i * 60 / 123.4 for i in range(20)], 3), peaks[0], peaks[1])
+                             pcav.BeatsSection([0.123456 + i * 60 / 123.4 for i in range(20)], 3), peaks[0], peaks[1])
 
     def test_phase_duration_timebase_and_no_drift(self):
         for rate in (44100, 48000):
@@ -97,15 +99,18 @@ class PcavTests(unittest.TestCase):
 
     def test_bad_counts_overlap_duplicate_and_events(self):
         base = bytearray(pcav.build_pcav_payload(self.fixture()))
-        for offset, value in ((7, 0), (16, 6), (11, 2**32 - 1)):
+        for offset, value in ((7, 0), (16, 6), (11, 2 ** 32 - 1)):
             data = base.copy()
             struct.pack_into('<I', data, offset, value)
             with self.assertRaises(ValueError): pcav.parse_pcav_payload(data)
-        duplicate = base.copy(); duplicate[15] = duplicate[6]
-        with self.assertRaises(ValueError): pcav.parse_pcav_payload(duplicate)
+        duplicate = base.copy();
+        duplicate[15] = duplicate[6]
+        with self.assertRaises(ValueError):
+            pcav.parse_pcav_payload(duplicate)
         for times in ([1, 1], [2, 1], [-1], [float('nan')], [float('inf')], [0, 0.0000001]):
             with self.assertRaises(ValueError): pcav.encode_beats(pcav.BeatsSection(times))
-        with self.assertRaises(ValueError): pcav.decode_peaks(struct.pack('<III', 2**32 - 1, 44100, 256))
+        with self.assertRaises(ValueError):
+            pcav.decode_peaks(struct.pack('<III', 2 ** 32 - 1, 44100, 256))
 
     def test_short_and_silent_peaks_include_tail(self):
         for size in (1, 2, 15, 255, 256, 257):
@@ -163,7 +168,8 @@ class PipelineTests(unittest.TestCase):
         self.key_patch = patch.object(analyze, 'detect_key', return_value=None)
         self.phase_patch = patch.object(analyze, 'detect_first_kick', return_value=1.75)
         for p in (self.beats_patch, self.key_patch, self.phase_patch):
-            p.start(); self.addCleanup(p.stop)
+            p.start();
+            self.addCleanup(p.stop)
 
     def run_import(self, **kwargs):
         return import_track.import_song(self.source, self.library, **kwargs)
@@ -200,7 +206,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(revisions), 1)
         revision = revisions[0]
         for name in ('analysis.pcav', 'analysis.json', 'plan_workzones.json'):
-            self.assertNotEqual(import_track.sha256_file(folder / name), import_track.sha256_file(revision / name), name)
+            self.assertNotEqual(import_track.sha256_file(folder / name), import_track.sha256_file(revision / name),
+                                name)
         for directory, downbeat_index, zones in ((folder, 3, []), (revision, 6, ZONED_ZONES)):
             parsed = pcav.read_pcav_file(directory / 'analysis.pcav')
             self.assertEqual(parsed.beats.first_downbeat_index, downbeat_index)
@@ -212,9 +219,52 @@ class PipelineTests(unittest.TestCase):
             for name, record in manifest['artifacts'].items():
                 self.assertEqual(import_track.sha256_file(directory / name), record['sha256'])
 
+    def test_replace_swaps_active_analysis_and_keeps_artwork_plans_and_candidates(self):
+        h = self.run_import()
+        folder = self.library / h
+        (folder / 'plans').mkdir()
+        (folder / 'plans/authored.json').write_text('authored')
+        (folder / 'thumb.avif').write_bytes(b'keep')
+        (folder / 'thumbnail.json').write_text('{}')
+        created = json.loads((folder / 'metadata.json').read_text())['createdAt']
+        with patch.object(analyze, 'extract_beats', side_effect=zoned):
+            self.cli(folder / 'original.wav', '--force')
+        with self.assertRaisesRegex(ValueError, '--replace requires --force'):
+            import_track.import_song(folder / 'original.wav', self.library, replace=True)
+        old = self.active(folder)
+        # A failed swap puts the old folder and its kept files back; nothing is left in the library root.
+        real_rename = Path.rename
+
+        def failing(self_, target):
+            if self_.name == 'track': raise OSError('swap failed')
+            return real_rename(self_, target)
+
+        with patch.object(analyze, 'extract_beats', side_effect=zoned), patch.object(Path, 'rename', failing), \
+                self.assertRaisesRegex(OSError, 'swap failed'):
+            self.run_import(force=True, replace=True)
+        self.assertEqual(self.active(folder), old)
+        self.assertEqual(sorted(p.name for p in self.library.iterdir()), [h])
+        with patch.object(analyze, 'extract_beats', side_effect=zoned):
+            out = self.cli(folder / 'original.wav', '--force', '--replace', '--title', 'Renamed')
+        self.assertRegex(out, f'(?m)^Replaced: .*{h} \\(active analysis updated')
+        self.assertNotRegex(out, '(?m)^Revision:')
+        self.assertEqual(out.splitlines()[-1], f'Hash: {h}')
+        self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 6)
+        self.assertEqual(json.loads((folder / 'plan_workzones.json').read_text())['zones'], ZONED_ZONES)
+        meta = json.loads((folder / 'metadata.json').read_text())
+        self.assertEqual((meta['title'], meta['createdAt']), ('Renamed', created))
+        self.assertEqual((folder / 'thumb.avif').read_bytes(), b'keep')
+        self.assertEqual((folder / 'thumbnail.json').read_text(), '{}')
+        self.assertEqual((folder / 'plans/authored.json').read_text(), 'authored')
+        self.assertEqual(len(list((folder / 'analyses').iterdir())), 1)
+        self.assertEqual(sorted(p.name for p in self.library.iterdir()), [h])
+        self.assertTrue((folder / 'manifest.json').is_file())
+        self.assertNotIn('retired', [p.name for p in folder.iterdir()])
+
     def cli(self, *argv):
         out = io.StringIO()
-        with patch.object(sys, 'argv', ['import_track.py', *map(str, argv), '--library', str(self.library)]), redirect_stdout(out):
+        with patch.object(sys, 'argv',
+                          ['import_track.py', *map(str, argv), '--library', str(self.library)]), redirect_stdout(out):
             import_track.main()
         return out.getvalue()
 
@@ -248,7 +298,8 @@ class PipelineTests(unittest.TestCase):
         for audio in (master, folder / 'nested/Original copy.WAV', folder / 'audio.m4a'):
             for force in (True, False):
                 with self.subTest(audio=audio.name, force=force), \
-                        self.assertRaisesRegex(ValueError, f'Unverifiable legacy identity: .* not its track directory {h}'):
+                        self.assertRaisesRegex(ValueError,
+                                               f'Unverifiable legacy identity: .* not its track directory {h}'):
                     import_track.import_song(audio, self.library, force=force)
                 self.assertEqual(self.snapshot(self.library), old)
                 self.assertNothingPublished(h)
@@ -314,9 +365,11 @@ class PipelineTests(unittest.TestCase):
         manifest = json.loads((folder / 'manifest.json').read_text())
         wrong_identity = {**manifest, 'audioFingerprint': {**manifest['audioFingerprint'], 'md5': 'f' * 32}}
         samples, rate = sf.read(folder / 'original.wav')
-        tampered_master = io.BytesIO(); sf.write(tampered_master, samples * 0.5, rate, format='WAV', subtype='PCM_24')
+        tampered_master = io.BytesIO();
+        sf.write(tampered_master, samples * 0.5, rate, format='WAV', subtype='PCM_24')
         cases = (
-            ('manifest.json', json.dumps(wrong_identity).encode(), folder / 'original.wav', 'Manifest identity does not match track directory'),
+            ('manifest.json', json.dumps(wrong_identity).encode(), folder / 'original.wav',
+             'Manifest identity does not match track directory'),
             ('original.wav', tampered_master.getvalue(), folder / 'original.wav', 'Retained master checksum mismatch'),
             ('source.wav', tampered_master.getvalue(), self.source, 'Retained source checksum mismatch'),
             ('source.wav', None, self.source, 'source.wav'),
@@ -356,27 +409,33 @@ class PipelineTests(unittest.TestCase):
     def test_inconsistent_timebase_zones_and_playback_never_published(self):
         def shift(field, amount):
             return lambda a: a['workZones'][0].update({field: a['workZones'][0][field] + amount})
+
         cases = (
-            ('analyze_audio', lambda a: a.update(duration=a['duration'] + 0.001), 'Analysis timebase does not match the retained master'),
-            ('analyze_audio', lambda a: a.update(sampleRate=44100), 'Analysis timebase does not match the retained master'),
+            ('analyze_audio', lambda a: a.update(duration=a['duration'] + 0.001),
+             'Analysis timebase does not match the retained master'),
+            ('analyze_audio', lambda a: a.update(sampleRate=44100),
+             'Analysis timebase does not match the retained master'),
             ('analyze_audio', shift('startSeconds', 0.01), 'Work zone times disagree with the measured grid'),
             ('analyze_audio', shift('durationSeconds', -0.01), 'Work zone times disagree with the measured grid'),
             ('analyze_audio', shift('startBar', 1), 'Work zone lies outside the measured bar grid'),
             ('analyze_audio', shift('durationBars', 1), 'Work zone lies outside the measured bar grid'),
-            ('probe_audio', lambda p: p.update(duration=str(float(p['duration']) + 0.06)), 'Playback duration differs from analyzed master'),
+            ('probe_audio', lambda p: p.update(duration=str(float(p['duration']) + 0.06)),
+             'Playback duration differs from analyzed master'),
         )
         with patch.object(analyze, 'extract_beats', side_effect=zoned):
             for force in (False, True):
                 old = self.snapshot(self.library)
                 for function, change, message in cases:
                     with self.subTest(force=force, message=message), \
-                            patch.object(import_track, function, side_effect=altered(getattr(import_track, function), change)), \
+                            patch.object(import_track, function,
+                                         side_effect=altered(getattr(import_track, function), change)), \
                             self.assertRaisesRegex(ValueError, message):
                         self.run_import(force=force)
                     self.assertEqual(self.snapshot(self.library), old)
                     self.assertNothingPublished(*[p.name for p in self.library.iterdir()])
                 h = self.run_import()
-                self.assertEqual(json.loads((self.library / h / 'plan_workzones.json').read_text())['zones'], ZONED_ZONES)
+                self.assertEqual(json.loads((self.library / h / 'plan_workzones.json').read_text())['zones'],
+                                 ZONED_ZONES)
 
     def test_beats_outside_duration_and_first_downbeat_snapping(self):
         for beats in ([0.5, 5.0], [-0.01, 0.5]):
@@ -407,7 +466,7 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(list(self.library.glob('.staging-*')))
 
     def test_metadata_dates_and_nonfinite_rejected(self):
-        with patch.object(import_track, 'extract_suno_metadata', return_value={'created':'not-a-date'}):
+        with patch.object(import_track, 'extract_suno_metadata', return_value={'created': 'not-a-date'}):
             with self.assertRaisesRegex(ValueError, 'Invalid createdAt: expected RFC 3339 date-time'): self.run_import()
         for field in ('bpm', 'duration'):
             nonfinite = altered(import_track.analyze_audio, lambda a: a.update({field: float('nan')}))
@@ -422,16 +481,20 @@ class PipelineTests(unittest.TestCase):
             self.run_import()
         self.assertEqual(list(self.library.iterdir()), [])
         # Too short or silent: refused from the input decode, before anything is staged.
-        for samples, rate, message in ((np.zeros(441000), 44100, 'audio is digital silence'), (np.sin(np.arange(12000) * .01), 48000, 'audio is 0.250 s long')):
+        for samples, rate, message in ((np.zeros(441000), 44100, 'audio is digital silence'),
+                                       (np.sin(np.arange(12000) * .01), 48000, 'audio is 0.250 s long')):
             sf.write(self.source, samples, rate)
-            with self.subTest(message=message), patch.object(import_track, 'staging_directory', side_effect=AssertionError('staged')), \
+            with self.subTest(message=message), patch.object(import_track, 'staging_directory',
+                                                             side_effect=AssertionError('staged')), \
                     self.assertRaisesRegex(analyze.NoBeatGrid, message):
                 self.run_import()
         with self.assertRaises(SystemExit) as refused: self.cli(self.source)
-        self.assertEqual(refused.exception.code, 'Error: refused Original song.wav: audio is 0.250 s long; at least 1 s required; nothing written')
+        self.assertEqual(refused.exception.code,
+                         'Error: refused Original song.wav: audio is 0.250 s long; at least 1 s required; nothing written')
         self.assertEqual(list(self.library.iterdir()), [])
         sf.write(self.source, np.sin(np.arange(441000) * .01) * .3, 44100)
-        self.assertEqual(pcav.read_pcav_file(self.library / self.run_import() / 'analysis.pcav').peaks.sample_rate, 44100)
+        self.assertEqual(pcav.read_pcav_file(self.library / self.run_import() / 'analysis.pcav').peaks.sample_rate,
+                         44100)
 
     def test_each_input_decoded_filtered_and_checksummed_once(self):
         # Repeated decodes, filters, checksums and a separate loudness pass made imports ~20% slower.
@@ -455,7 +518,8 @@ class PipelineTests(unittest.TestCase):
                 # master encodes AAC and measures loudness (started with Popen so it overlaps analysis).
                 self.assertIs(analyze.extract_beats.call_args.args[0], analyze.detect_key.call_args.args[0])
                 spawned = [c.args[0] for c in run.call_args_list + popen.call_args_list]
-                masters = [argv for argv in spawned if '-i' in argv and Path(argv[argv.index('-i') + 1]).name == 'original.wav']
+                masters = [argv for argv in spawned if
+                           '-i' in argv and Path(argv[argv.index('-i') + 1]).name == 'original.wav']
                 encodes = [argv for argv in masters if 'aac' in argv]
                 self.assertEqual(len(masters), 2, masters)
                 self.assertEqual(len(encodes), 1)
@@ -470,7 +534,8 @@ class PipelineTests(unittest.TestCase):
         for audio, replacement in ((self.source, altered_wav), (encoded, altered_m4a)):
             # The file changes after its identity was decoded and before it is staged.
             with self.subTest(audio=audio.name), \
-                    patch.object(import_track, 'require_sound', side_effect=lambda *_, src=replacement, dst=audio: shutil.copyfile(src, dst)), \
+                    patch.object(import_track, 'require_sound',
+                                 side_effect=lambda *_, src=replacement, dst=audio: shutil.copyfile(src, dst)), \
                     self.assertRaisesRegex(ValueError, 'Input changed during import'):
                 import_track.import_song(audio, self.library)
             self.assertEqual(list(self.library.iterdir()), [])
@@ -478,7 +543,8 @@ class PipelineTests(unittest.TestCase):
     def stalled_import(self):
         """Start the CLI in its own session; return it and its grandchild's pid once analysis has stalled in the stage."""
         marker = self.root / f'stalled-{time.monotonic_ns()}.pid'
-        proc = subprocess.Popen([sys.executable, '-c', STALLED_IMPORT, str(Path(import_track.__file__).parent), str(import_track.SCHEMA_DIR),
+        proc = subprocess.Popen([sys.executable, '-c', STALLED_IMPORT, str(Path(import_track.__file__).parent),
+                                 str(import_track.SCHEMA_DIR),
                                  str(marker), str(self.source), '--library', str(self.library)],
                                 start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.addCleanup(lambda: proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL))
@@ -502,7 +568,8 @@ class PipelineTests(unittest.TestCase):
                 time.sleep(.0005)
             self.assertEqual(proc.wait(30), 128 + signal.SIGTERM, proc.stderr.read().decode())
             self.assertEqual(list(self.library.iterdir()), [])
-            with self.assertRaises(ProcessLookupError): os.kill(child, 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
 
     def test_stale_stages_from_killed_imports_swept_live_ones_kept(self):
         aged = lambda path: os.utime(path, (time.time() - 3600,) * 2, follow_symlinks=False) or path
@@ -516,12 +583,15 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(stage, leftover)
         # Only unlocked, aged, real staging directories go: never a live stage, a fresh one, a symlink, a track or a candidate.
         h = self.run_import()
-        decoy = self.root / 'decoy'; decoy.mkdir(); (decoy / 'keep').write_text('keep')
+        decoy = self.root / 'decoy';
+        decoy.mkdir();
+        (decoy / 'keep').write_text('keep')
         (self.library / '.staging-0123456789ab-symlink1').symlink_to(decoy, target_is_directory=True)
         (self.library / '.staging-0123456789ab-fresh123').mkdir()
         (self.library / '.staging-other').mkdir()
         (self.library / h / 'analyses/.staging-0123456789ab-candidat').mkdir(parents=True)
-        for path in (stage, self.library / '.staging-0123456789ab-symlink1', self.library / '.staging-other', self.library / h / 'analyses/.staging-0123456789ab-candidat'):
+        for path in (stage, self.library / '.staging-0123456789ab-symlink1', self.library / '.staging-other',
+                     self.library / h / 'analyses/.staging-0123456789ab-candidat'):
             aged(path)
         kept = sorted(self.library.rglob('*'))
         with patch.object(analyze, 'extract_beats', side_effect=zoned):
@@ -537,33 +607,36 @@ class PipelineTests(unittest.TestCase):
         samples, rate = sf.read(self.source)
         sf.write(derived, np.concatenate([np.zeros(rate), samples]), rate, subtype='FLOAT')
         record = self.root / 'processed.wav.json'
-        record.write_text(json.dumps({'version':1, 'inputSha256':import_track.sha256_file(self.source), 'outputSha256':import_track.sha256_file(derived), 'presets': [{'name':'test_swell'}]}))
+        record.write_text(json.dumps({'version': 1, 'inputSha256': import_track.sha256_file(self.source),
+                                      'outputSha256': import_track.sha256_file(derived),
+                                      'presets': [{'name': 'test_swell'}]}))
         h = import_track.import_song(derived, self.library, source_file=self.source, processing_record=record)
         folder = self.library / h
-        self.assertEqual((folder/'source.wav').read_bytes(), self.source.read_bytes())
-        self.assertEqual(json.loads((folder/'metadata.json').read_text())['title'], 'Original song')
-        import_track.import_song(folder/'original.wav', self.library, force=True)
-        revision = next((folder/'analyses').iterdir())
-        manifest = json.loads((revision/'manifest.json').read_text())
+        self.assertEqual((folder / 'source.wav').read_bytes(), self.source.read_bytes())
+        self.assertEqual(json.loads((folder / 'metadata.json').read_text())['title'], 'Original song')
+        import_track.import_song(folder / 'original.wav', self.library, force=True)
+        revision = next((folder / 'analyses').iterdir())
+        manifest = json.loads((revision / 'manifest.json').read_text())
         self.assertEqual(manifest['source']['name'], self.source.name)
         self.assertEqual(manifest['processing'], json.loads(record.read_text()))
-        self.assertEqual((revision/'source.wav').read_bytes(), self.source.read_bytes())
+        self.assertEqual((revision / 'source.wav').read_bytes(), self.source.read_bytes())
         record.write_text('{}')
         with self.assertRaises(ValueError):
-            import_track.import_song(derived, self.library, source_file=self.source, processing_record=record, force=True)
+            import_track.import_song(derived, self.library, source_file=self.source, processing_record=record,
+                                     force=True)
 
     def test_converted_master_reanalysis_retains_identity(self):
         encoded = self.root / 'download.m4a'
         import_track.convert_to_m4a(self.source, encoded)
         h = import_track.import_song(encoded, self.library)
         folder = self.library / h
-        self.assertEqual((folder/'source.m4a').read_bytes(), encoded.read_bytes())
+        self.assertEqual((folder / 'source.m4a').read_bytes(), encoded.read_bytes())
         # Without --force the retained master maps to its track, not a duplicate titled "original".
-        self.assertEqual(import_track.import_song(folder/'original.wav', self.library), h)
+        self.assertEqual(import_track.import_song(folder / 'original.wav', self.library), h)
         self.assertNothingPublished(h)
-        self.assertEqual(import_track.import_song(folder/'original.wav', self.library, force=True), h)
+        self.assertEqual(import_track.import_song(folder / 'original.wav', self.library, force=True), h)
         self.assertEqual(len(list(self.library.iterdir())), 1)
-        self.assertEqual(len(list((folder/'analyses').iterdir())), 1)
+        self.assertEqual(len(list((folder / 'analyses').iterdir())), 1)
 
     def test_missing_source_collision_and_symlink_rejected(self):
         h = self.run_import()
@@ -572,9 +645,12 @@ class PipelineTests(unittest.TestCase):
         with patch.object(import_track, 'fingerprint', return_value=h + 'f' * 20):
             with self.assertRaisesRegex(ValueError, 'Hash collision'): self.run_import(force=True)
         self.assertEqual(self.snapshot(folder), old)
-        alternate = self.root / 'alternate'; alternate.mkdir()
+        alternate = self.root / 'alternate';
+        alternate.mkdir()
         (alternate / h).symlink_to(folder, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, 'must not be a symlink'): import_track.import_song(self.source, alternate, force=True)
+        with self.assertRaisesRegex(ValueError, 'must not be a symlink'): import_track.import_song(self.source,
+                                                                                                   alternate,
+                                                                                                   force=True)
 
 
 if __name__ == '__main__':

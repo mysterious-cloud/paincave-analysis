@@ -132,7 +132,8 @@ def correct_octave_errors(bpm_curve: np.ndarray, reference_bpm: float, tolerance
     return corrected
 
 
-def compute_tempo_curve(beat_times: np.ndarray, window: int = 8, reference_bpm: float | None = None) -> tuple[np.ndarray, list[dict]]:
+def compute_tempo_curve(beat_times: np.ndarray, window: int = 8, reference_bpm: float | None = None) -> tuple[
+    np.ndarray, list[dict]]:
     """Compute local BPM from beat intervals."""
     print("Computing tempo curve...")
 
@@ -218,9 +219,9 @@ def compute_band_energy(filtered: np.ndarray, sr: int) -> np.ndarray:
 
 
 def compute_kick_density(
-    bass_energy: np.ndarray,
-    beats: list[dict],
-    duration: float | None = None,
+        bass_energy: np.ndarray,
+        beats: list[dict],
+        duration: float | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Time-weighted bass energy over complete bar intervals, including beat four."""
     downbeats = [b for b in beats if b["bar"] > 0 and b["beat"] == 1]
@@ -245,11 +246,11 @@ def compute_kick_density(
 
 
 def detect_kick_zones(
-    kick_density: np.ndarray,
-    bar_info: list[dict],
-    threshold: float = 0.45,
-    min_zone_bars: int = 4,
-    duration: float | None = None
+        kick_density: np.ndarray,
+        bar_info: list[dict],
+        threshold: float = 0.45,
+        min_zone_bars: int = 4,
+        duration: float | None = None
 ) -> list[dict]:
     """Detect contiguous zones of kick presence vs absence."""
     print("Detecting kick zones...")
@@ -303,10 +304,10 @@ def detect_kick_zones(
 
 
 def detect_first_kick(
-    bass: np.ndarray,
-    sr: int,
-    beat_times: np.ndarray,
-    beat_positions: np.ndarray
+        bass: np.ndarray,
+        sr: int,
+        beat_times: np.ndarray,
+        beat_positions: np.ndarray
 ) -> float:
     """
     Detect the correct first downbeat by analyzing where kick patterns start.
@@ -413,7 +414,7 @@ def compute_beat_confidence(beat_times: np.ndarray, expected_bpm: float) -> np.n
         elif i == len(beat_times) - 1:
             deviation = abs(intervals[-1] - expected_interval)
         else:
-            deviation = (abs(intervals[i-1] - expected_interval) + abs(intervals[i] - expected_interval)) / 2
+            deviation = (abs(intervals[i - 1] - expected_interval) + abs(intervals[i] - expected_interval)) / 2
 
         confidence = np.exp(-(deviation / tolerance) ** 2)
         confidences.append(float(confidence))
@@ -422,10 +423,10 @@ def compute_beat_confidence(beat_times: np.ndarray, expected_bpm: float) -> np.n
 
 
 def build_beats_array(
-    beat_times: np.ndarray,
-    beat_positions: np.ndarray,
-    first_downbeat_t: float | None = None,
-    confidences: np.ndarray | None = None
+        beat_times: np.ndarray,
+        beat_positions: np.ndarray,
+        first_downbeat_t: float | None = None,
+        confidences: np.ndarray | None = None
 ) -> list[dict]:
     """Build the beats array with bar and beat information."""
     beats = []
@@ -477,12 +478,12 @@ def build_beats_array(
 
 
 def analyze_audio(
-    audio_path: Path,
-    min_bpm: int = 100,
-    max_bpm: int = 180,
-    reference_bpm: float | None = None,
-    first_downbeat: float | None = None,
-    audio: tuple[np.ndarray, int] | None = None,
+        audio_path: Path,
+        min_bpm: int = 100,
+        max_bpm: int = 180,
+        reference_bpm: float | None = None,
+        first_downbeat: float | None = None,
+        audio: tuple[np.ndarray, int] | None = None,
 ) -> dict:
     """Main analysis pipeline. `audio` is the file's already decoded (samples, rate), if any."""
 
@@ -509,7 +510,8 @@ def analyze_audio(
     if np.any(beat_times < 0) or np.any(beat_times >= duration):
         raise ValueError("Detected beats lie outside audio duration")
     if len(beat_times) < MIN_BEATS:
-        raise NoBeatGrid(f"no beat grid: {len(beat_times)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
+        raise NoBeatGrid(
+            f"no beat grid: {len(beat_times)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
 
     tempo_curve, tempo_segments = compute_tempo_curve(beat_times, reference_bpm=reference_bpm)
     global_bpm = float(np.median(tempo_curve))
