@@ -32,7 +32,9 @@ from content_hash import load_audio_samples
 MIN_DURATION_SECONDS = 1
 MIN_BEATS = 8  # two bars of 4/4: a tempo median, a downbeat and one complete bar
 BEATS_PER_BAR = 4
-MAX_GRID_RESIDUAL_MS = 60  # above this the detections do not describe one constant tempo
+MAX_GRID_RESIDUAL_MS = 60  # above this the detections do not describe a rideable grid
+LOCAL_WINDOWS = (32, 64, 128)  # beats each side of a grid beat: 8, 16 and 32 bars
+LOCAL_MARGIN = 8  # extra beat slots fitted past each end before the grid is trimmed to the audio
 
 
 class NoBeatGrid(ValueError):
@@ -92,23 +94,20 @@ def extract_beats(audio: np.ndarray, sr: int, min_bpm: int = 100, max_bpm: int =
 
 @dataclass(frozen=True)
 class GridFit:
-    """One constant-tempo beat grid fitted to detections, covering the whole track."""
+    """A beat grid fitted to detections, covering the whole track."""
 
-    period: float           # seconds per beat
-    phase: float            # time of grid index 0; may lie before the audio
+    period: float           # seconds per beat of the global line: the reference tempo
+    phase: float            # time of grid index 0 on that line; may lie before the audio
     beat_times: np.ndarray  # every grid beat with 0 <= t < duration
+    index: np.ndarray       # grid index of each beat time, counted from `phase`
     heard: np.ndarray       # per grid beat: a detection landed on it
     bar_phase: int          # grid index modulo 4 that carries the downbeats
     residual_ms: float      # RMS distance between heard grid beats and their detections
 
     @property
     def bpm(self) -> float:
-        return 60 / self.period
-
-    @property
-    def index(self) -> np.ndarray:
-        """Grid index of each beat time, counted from `phase`."""
-        return np.rint((self.beat_times - self.phase) / self.period).astype(int)
+        """Tempo of the median grid interval; local tempo varies with the drift the grid follows."""
+        return 60 / float(np.median(np.diff(self.beat_times)))
 
 
 def _nearest_index(values: np.ndarray, targets: np.ndarray) -> np.ndarray:
@@ -140,6 +139,65 @@ def _beat_indices(beats: np.ndarray, period: float) -> np.ndarray:
     return np.concatenate([[0.0], np.cumsum(np.round(np.diff(beats) / period))])
 
 
+def _local_line(k: np.ndarray, t: np.ndarray, n: int, fallback: tuple[float, float]) -> tuple[float, float]:
+    """Least-squares line over the detections neighbouring grid beat `n`, widening until 8 of them fit.
+
+    Past either end of the detections the window stays anchored on the last of them, so the grid leaves
+    the music on one straight line instead of on a slope refitted from a handful of stragglers.
+    """
+    center = min(max(n, k[0]), k[-1])
+    for half in LOCAL_WINDOWS:
+        lo = int(np.searchsorted(k, center - half, "left"))
+        hi = int(np.searchsorted(k, center + half, "right"))
+        if hi - lo >= MIN_BEATS and k[hi - 1] > k[lo]:
+            return _fit_line(k[lo:hi], t[lo:hi])
+    return fallback
+
+
+def _place(k: np.ndarray, t: np.ndarray, index: np.ndarray, fallback: tuple[float, float]) -> np.ndarray:
+    """Time of each index, from the line fitted over the detections around it."""
+
+    def at(n: float) -> float:
+        local_period, local_t0 = _local_line(k, t, n, fallback)
+        return local_t0 + local_period * n
+
+    return np.fromiter(map(at, index), float, len(index))
+
+
+def _grid_times(k: np.ndarray, t: np.ndarray, period: float, t0: float, duration: float) -> tuple[
+    np.ndarray, np.ndarray]:
+    """Grid indices and times, each beat placed by a line fitted to its own neighbourhood.
+
+    On a track that holds one tempo every local line coincides with the global one; on a track that
+    drifts the grid follows it, and over a silent stretch the detections on both sides carry it across.
+    """
+    low, high = math.floor(-t0 / period) - LOCAL_MARGIN, math.ceil((duration - t0) / period) + LOCAL_MARGIN
+    for _ in range(8):
+        index = np.arange(low, high + 1)
+        times = _place(k, t, index, (period, t0))
+        if times[0] < 0 and times[-1] >= duration:
+            break
+        low -= LOCAL_MARGIN if times[0] >= 0 else 0
+        high += LOCAL_MARGIN if times[-1] < duration else 0
+    else:
+        raise NoBeatGrid("no beat grid: the fitted grid does not reach both ends of the audio")
+    inside = (times >= 0) & (times < duration)
+    return index[inside], times[inside]
+
+
+def _number_and_fit(beats: np.ndarray, period: float) -> tuple[np.ndarray, float, float]:
+    """Number the detections, fit t = t0 + k·period, then renumber with the fitted period and refit.
+
+    The first period comes from a median of 20 ms-quantized intervals and can be a percent out, which is
+    enough to lose a beat when the numbering has to step across a silent stretch; the renumber spends
+    that better period on the gaps.
+    """
+    for _ in range(2):
+        k = _beat_indices(beats, period)
+        period, t0 = _fit_line(k, beats)
+    return k, period, t0
+
+
 def _octave_correct(period: float, min_bpm: float, max_bpm: float) -> float:
     """Halve or double the period until its tempo lies within the bounds."""
     for _ in range(8):
@@ -159,12 +217,14 @@ def fit_beat_grid(
         min_bpm: int = 100,
         max_bpm: int = 180,
 ) -> GridFit:
-    """Fit one constant-tempo grid to the detections and extend it across the whole track.
+    """Fit a beat grid to the detections and extend it across the whole track.
 
-    SUNO masters hold a single tempo, so one period and phase describe the track; a track that really
-    changes tempo is fitted to its median period and rejected once the residual grows past
-    MAX_GRID_RESIDUAL_MS. Detections are quantized to 20 ms frames, but the least-squares refit over
-    hundreds of them recovers a period far finer than one frame.
+    One global least-squares line octave-corrects the tempo and numbers the detections; each grid beat
+    is then placed by a line fitted over the detections within 8 bars of it, so a slow drift (a SUNO
+    master can accelerate by more than a BPM over three minutes) is followed instead of averaged away.
+    A sudden tempo change is not modelled: the grid bends across it and the residual gate rejects the
+    track. Detections are quantized to 20 ms frames, but each local fit over dozens of them recovers a
+    period far finer than one frame.
     """
     beats = np.sort(np.asarray(det_beats, dtype=float))
     if len(beats) < MIN_BEATS or not np.isfinite(beats).all():
@@ -181,27 +241,32 @@ def fit_beat_grid(
 
     inliers = beats
     for _ in range(3):
-        k = _beat_indices(inliers, period)
-        period, t0 = _fit_line(k, inliers)
-        keep = np.abs(inliers - (t0 + k * period)) <= 0.2 * period
+        k, period, t0 = _number_and_fit(inliers, period)
+        # Judged against the grid each detection would get, not against one straight line: a track that
+        # drifts leaves a single line by most of a beat at its ends, and those are not stray detections.
+        keep = np.abs(inliers - _place(k, inliers, k, (period, t0))) <= 0.2 * period
         if keep.all():
             break
-        inliers = inliers[keep]
+        inliers, k = inliers[keep], k[keep]
         if len(inliers) < MIN_BEATS:
-            raise NoBeatGrid(f"no beat grid: only {len(inliers)} detections fit one constant tempo; "
+            raise NoBeatGrid(f"no beat grid: only {len(inliers)} detections fit one tempo curve; "
                              f"at least {MIN_BEATS} required")
     else:  # the last pass dropped outliers, so refit without them
-        k = _beat_indices(inliers, period)
-        period, t0 = _fit_line(k, inliers)
+        k, period, t0 = _number_and_fit(inliers, period)
     if not min_bpm <= 60 / period <= max_bpm:
         raise NoBeatGrid(f"no beat grid: fitted tempo {60 / period:.1f} BPM outside {min_bpm}-{max_bpm} BPM")
 
-    index = np.arange(math.ceil(-t0 / period), math.floor((duration - t0) / period) + 1)
-    grid = t0 + index * period
-    inside = (grid >= 0) & (grid < duration)
-    index, grid = index[inside], grid[inside]
+    index, grid = _grid_times(k, inliers, period, t0, duration)
     if len(grid) < MIN_BEATS:
         raise NoBeatGrid(f"no beat grid: {len(grid)} beats fit in {duration:.1f} s at {60 / period:.1f} BPM")
+    spacing = np.diff(grid)
+    if spacing.min() <= 0:
+        raise NoBeatGrid("no beat grid: the fitted grid does not advance in time")
+    fastest, slowest = 60 / spacing.min(), 60 / spacing.max()
+    # 1% of slack: a grid that follows the drift of a track sitting on a bound may cross it by a hair.
+    if fastest > max_bpm * 1.01 or slowest < min_bpm * 0.99:
+        raise NoBeatGrid(f"no beat grid: the grid runs {slowest:.1f}-{fastest:.1f} BPM, "
+                         f"outside {min_bpm}-{max_bpm} BPM")
 
     tolerance = max(0.07, 0.2 * period)
     offset = grid - beats[_nearest_index(beats, grid)]
@@ -213,8 +278,8 @@ def fit_beat_grid(
         raise NoBeatGrid(f"no beat grid: detections scatter {residual_ms:.0f} ms around the fitted "
                          f"{60 / period:.1f} BPM grid; at most {MAX_GRID_RESIDUAL_MS} ms allowed")
 
-    return GridFit(period, t0, grid, heard, _vote_bar_phase(index, grid, det_downbeats, tolerance, heard),
-                   residual_ms)
+    return GridFit(period, t0, grid, index, heard,
+                   _vote_bar_phase(index, grid, det_downbeats, tolerance, heard), residual_ms)
 
 
 def _vote_bar_phase(index: np.ndarray, grid: np.ndarray, det_downbeats, tolerance: float,
@@ -231,6 +296,16 @@ def _vote_bar_phase(index: np.ndarray, grid: np.ndarray, det_downbeats, toleranc
     if not votes.any():  # no downbeats survived: bar 1 starts on the first beat actually heard
         return int(index[np.argmax(heard)] % BEATS_PER_BAR)
     return int(np.argmax(votes))
+
+
+def tempo_range(fit: GridFit, window: float = 30) -> tuple[float, float]:
+    """Lowest and highest local tempo of the grid, taken as the median interval of each 30 s window."""
+    tempos = []
+    for start in np.arange(0, fit.beat_times[-1], window):
+        beats = fit.beat_times[(fit.beat_times >= start) & (fit.beat_times < start + window)]
+        if len(beats) >= MIN_BEATS:  # a partial window at the end says nothing about tempo
+            tempos.append(60 / float(np.median(np.diff(beats))))
+    return (round(min(tempos), 1), round(max(tempos), 1)) if tempos else (round(fit.bpm, 1), round(fit.bpm, 1))
 
 
 def first_bar_time(fit: GridFit) -> float:
@@ -459,6 +534,7 @@ def analyze_audio(
         grid_out.update(
             detectedBeatCount=len(det_beats), detectedDownbeatCount=len(det_downbeats),
             inferredBeatCount=inferred, residualMs=round(fit.residual_ms, 2), barPhase=fit.bar_phase,
+            tempoRangeBpm=list(tempo_range(fit)),
         )
 
     return {

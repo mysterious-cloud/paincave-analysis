@@ -146,11 +146,18 @@ class GridFitTests(unittest.TestCase):
         times = start + np.arange(count) * (period or self.PERIOD)
         return np.round(times / quantize) * quantize if quantize else times
 
+    def accelerating(self, start_bpm=168.0, end_bpm=171.0, seconds=180.0, quantize=0.02):
+        """Beat times of a track that speeds up steadily, as the detector would report them."""
+        count = int(seconds * (start_bpm + end_bpm) / 120)
+        periods = 60 / np.linspace(start_bpm, end_bpm, count)
+        times = 0.4 + np.concatenate([[0.0], np.cumsum(periods[:-1])])
+        return np.round(times / quantize) * quantize, float(times[-1] + periods[-1])
+
     def test_gap_is_filled_with_inferred_beats(self):
         beats = np.concatenate([self.detections(24), self.detections(40, start=1.0 + 44 * self.PERIOD)])
         fit = analyze.fit_beat_grid(beats, beats[::4], 60.0)
         spacing = np.diff(fit.beat_times)
-        self.assertLess(spacing.max() - spacing.min(), 1e-9)
+        self.assertLess(spacing.max() - spacing.min(), 0.002)  # one tempo, so every local line agrees
         self.assertLess(fit.beat_times[0], fit.period)          # the grid reaches back before the first detection
         self.assertGreater(fit.beat_times[-1], 60 - fit.period)  # and on past the last one
         silent = (fit.beat_times > beats[23] + 0.1) & (fit.beat_times < beats[24] - 0.1)
@@ -162,10 +169,34 @@ class GridFitTests(unittest.TestCase):
     def test_quantized_detections_recover_the_true_period(self):
         fit = analyze.fit_beat_grid(self.detections(), self.detections()[::4], 120.0)
         self.assertLess(abs(fit.period - self.PERIOD) * 1000, 0.05)
-        self.assertAlmostEqual(fit.bpm, 137.3, places=2)
+        self.assertAlmostEqual(fit.bpm, 137.3, places=1)
         self.assertLess(fit.residual_ms, 12)
         self.assertGreater(fit.beat_times[0], 0)
         self.assertLess(fit.beat_times[0], self.PERIOD)
+
+    def test_exact_constant_tempo_reproduces_the_global_line(self):
+        beats = self.detections(quantize=None)
+        fit = analyze.fit_beat_grid(beats, beats[::4], 120.0)
+        self.assertLess(np.abs(fit.beat_times - (fit.phase + fit.index * fit.period)).max(), 1e-9)
+        # With 20 ms quantization the local lines wobble, but stay well inside one detector frame.
+        rough = analyze.fit_beat_grid(self.detections(), self.detections()[::4], 120.0)
+        self.assertLess(np.abs(rough.beat_times - (rough.phase + rough.index * rough.period)).max(), 0.01)
+
+    def test_grid_follows_a_slow_accelerando(self):
+        beats, duration = self.accelerating()
+        played = beats[(beats < 60) | (beats >= 80)]  # a 20 s stretch the detector hears nothing in
+        fit = analyze.fit_beat_grid(played, played[::4], duration)
+        self.assertLess(fit.residual_ms, 12)
+        self.assertAlmostEqual(len(fit.beat_times), len(beats), delta=1)  # one beat of slack at the edges
+        detected = (fit.beat_times >= played[0] - 0.05) & (fit.beat_times <= played[-1] + 0.05)
+        self.assertTrue(fit.heard[detected & ((fit.beat_times < 59.5) | (fit.beat_times > 80.5))].all())
+        self.assertFalse(fit.heard[(fit.beat_times > 61) & (fit.beat_times < 79)].any())
+        low, high = analyze.tempo_range(fit)
+        self.assertAlmostEqual(low, 168, delta=0.6)
+        self.assertAlmostEqual(high, 171, delta=0.6)
+        numbered = analyze.build_beats_array(fit.beat_times, analyze.first_bar_time(fit))
+        first = numbered.index(next(b for b in numbered if b['bar'] == 1))
+        self.assertEqual(max(b['bar'] for b in numbered), (len(numbered) - first + 3) // 4)
 
     def test_half_tempo_detections_are_octave_corrected(self):
         beats = self.detections(120, period=2 * self.PERIOD)
@@ -198,8 +229,8 @@ class GridFitTests(unittest.TestCase):
     def test_same_detections_give_the_same_grid(self):
         beats, downbeats = self.detections(), self.detections()[::4]
         first, second = (analyze.fit_beat_grid(beats, downbeats, 120.0) for _ in range(2))
-        self.assertEqual((first.period, first.phase, first.bar_phase, first.residual_ms),
-                         (second.period, second.phase, second.bar_phase, second.residual_ms))
+        self.assertEqual((first.period, first.phase, first.bar_phase, first.residual_ms, first.bpm),
+                         (second.period, second.phase, second.bar_phase, second.residual_ms, second.bpm))
         self.assertTrue(np.array_equal(first.beat_times, second.beat_times))
         self.assertTrue(np.array_equal(first.heard, second.heard))
 
