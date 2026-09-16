@@ -45,16 +45,17 @@ with patch.object(analyze, 'extract_beats', side_effect=stall), patch.object(sys
 
 
 def detected(*args, **kwargs):
-    return np.arange(0.25, 4.75, 0.5), np.array([2, 3, 4, 1, 2, 3, 4, 1, 2])
+    """Detections on a 120 BPM half-note grid with downbeats on 1.75 s; the fitted grid reaches 4.75 s."""
+    return np.arange(0.25, 4.75, 0.5), np.array([1.75, 3.75])
 
 
-# A different, denser grid: with the 1.75 s downbeat stub it yields four bars and one work zone.
-ZONED_ZONES = [{'startBar': 1, 'durationBars': 4, 'startSeconds': 1.75, 'durationSeconds': 3.25}]
+# A different, denser grid: 180 BPM from 0 s, five bars over the fixture, all of them work.
+ZONED_ZONES = [{'startBar': 1, 'durationBars': 5, 'startSeconds': 0.0, 'durationSeconds': 6.0}]
 
 
 def zoned(*args, **kwargs):
-    times = np.arange(0.25, 4.8, 0.25)
-    return times, np.arange(len(times)) % 4 + 1
+    times = np.arange(0, 6, 1 / 3)
+    return times, times[::4]
 
 
 def altered(target, change):
@@ -130,22 +131,87 @@ class PcavTests(unittest.TestCase):
 
 class AnalyzerTests(unittest.TestCase):
     def test_pickup_numbers_match_python_and_ts_contract(self):
-        beats = analyze.build_beats_array(np.arange(10, dtype=float), np.ones(10), 7)
+        beats = analyze.build_beats_array(np.arange(10, dtype=float), 7)
         self.assertEqual([b['beat'] for b in beats[:7]], [2, 3, 4, 1, 2, 3, 4])
         self.assertEqual(beats[7]['bar'], 1)
         self.assertEqual(beats[7]['beat'], 1)
 
-    def test_sparse_empty_and_tempo_ambiguity(self):
-        for beats in (np.array([]), np.array([1.0])):
-            curve, segments = analyze.compute_tempo_curve(beats)
-            self.assertEqual(len(curve), 0)
-            self.assertEqual(segments, [])
-        for spacing in (0.25, 0.5, 1):
-            curve, _ = analyze.compute_tempo_curve(np.arange(32) * spacing, reference_bpm=120)
-            self.assertTrue(np.isfinite(curve).all())
-            self.assertEqual(float(np.median(curve)), 120)
-        for beats in (np.array([1, 1]), np.array([2, 1]), np.array([1, np.nan])):
-            with self.assertRaises(ValueError): analyze.compute_tempo_curve(beats)
+
+class GridFitTests(unittest.TestCase):
+    """The detector is silent in quiet passages and quantizes to 20 ms; plans need an unbroken grid."""
+
+    PERIOD = 60 / 137.3
+
+    def detections(self, count=200, start=1.0, period=None, quantize=0.02):
+        times = start + np.arange(count) * (period or self.PERIOD)
+        return np.round(times / quantize) * quantize if quantize else times
+
+    def test_gap_is_filled_with_inferred_beats(self):
+        beats = np.concatenate([self.detections(24), self.detections(40, start=1.0 + 44 * self.PERIOD)])
+        fit = analyze.fit_beat_grid(beats, beats[::4], 60.0)
+        spacing = np.diff(fit.beat_times)
+        self.assertLess(spacing.max() - spacing.min(), 1e-9)
+        self.assertLess(fit.beat_times[0], fit.period)          # the grid reaches back before the first detection
+        self.assertGreater(fit.beat_times[-1], 60 - fit.period)  # and on past the last one
+        silent = (fit.beat_times > beats[23] + 0.1) & (fit.beat_times < beats[24] - 0.1)
+        self.assertEqual(silent.sum(), 20)  # the 20 beat slots the detector heard nothing on
+        self.assertFalse(fit.heard[silent].any())
+        played = (fit.beat_times >= beats[0] - 0.001) & (fit.beat_times <= beats[23] + 0.001)
+        self.assertTrue(fit.heard[played].all())
+
+    def test_quantized_detections_recover_the_true_period(self):
+        fit = analyze.fit_beat_grid(self.detections(), self.detections()[::4], 120.0)
+        self.assertLess(abs(fit.period - self.PERIOD) * 1000, 0.05)
+        self.assertAlmostEqual(fit.bpm, 137.3, places=2)
+        self.assertLess(fit.residual_ms, 12)
+        self.assertGreater(fit.beat_times[0], 0)
+        self.assertLess(fit.beat_times[0], self.PERIOD)
+
+    def test_half_tempo_detections_are_octave_corrected(self):
+        beats = self.detections(120, period=2 * self.PERIOD)
+        fit = analyze.fit_beat_grid(beats, beats[::2], 120.0, min_bpm=100, max_bpm=180)
+        self.assertAlmostEqual(fit.bpm, 137.3, places=1)
+        self.assertEqual(fit.heard.sum(), len(beats))
+        self.assertEqual((~fit.heard).sum(), len(fit.beat_times) - len(beats))
+
+    def test_downbeat_vote_sets_bar_phase_and_first_bar(self):
+        beats = self.detections()
+        for offset in range(4):
+            fit = analyze.fit_beat_grid(beats, beats[offset::4], 120.0)
+            first = analyze.first_bar_time(fit)
+            self.assertEqual(fit.bar_phase, int(fit.index[np.argmin(np.abs(fit.beat_times - beats[offset]))] % 4))
+            self.assertAlmostEqual(first, beats[offset], delta=0.021)
+            numbered = analyze.build_beats_array(fit.beat_times, first)
+            self.assertEqual([b['bar'] for b in numbered if b['t'] == round(first, 3)], [1])
+        # Without downbeats, bar 1 falls on the first beat the detector actually heard.
+        self.assertAlmostEqual(analyze.first_bar_time(analyze.fit_beat_grid(beats, [], 120.0)), beats[0], delta=0.021)
+
+    def test_too_few_or_scattered_detections_have_no_grid(self):
+        for beats, message in (
+                (self.detections(5), 'usable beat detections'),
+                (np.arange(20) * 0.05, 'far outside 100-180 BPM'),
+                (np.cumsum(np.concatenate([[1.0], np.tile([0.30, 0.62], 30)])), 'scatter'),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(analyze.NoBeatGrid, message):
+                analyze.fit_beat_grid(beats, beats[::4], 120.0)
+
+    def test_same_detections_give_the_same_grid(self):
+        beats, downbeats = self.detections(), self.detections()[::4]
+        first, second = (analyze.fit_beat_grid(beats, downbeats, 120.0) for _ in range(2))
+        self.assertEqual((first.period, first.phase, first.bar_phase, first.residual_ms),
+                         (second.period, second.phase, second.bar_phase, second.residual_ms))
+        self.assertTrue(np.array_equal(first.beat_times, second.beat_times))
+        self.assertTrue(np.array_equal(first.heard, second.heard))
+
+    @unittest.skipUnless(analyze.models.checkpoint_path().is_file(), "checkpoint not cached")
+    def test_detector_smoke(self):
+        sr = 22050
+        click = np.zeros(sr * 12)
+        for i in range(0, len(click), int(sr * 0.5)):
+            click[i:i + 200] = np.sin(np.arange(200) * 0.5) * 0.9
+        beats, downbeats = analyze.extract_beats(click, sr)
+        self.assertGreater(len(beats), 8)
+        self.assertAlmostEqual(analyze.fit_beat_grid(beats, downbeats, 12.0, 100, 180).bpm, 120, delta=1)
 
     def test_energy_covers_final_second_and_complete_bar(self):
         self.assertEqual(len(analyze.compute_band_energy(analyze.band_pass(np.ones(48001), 48000), 48000)), 2)
@@ -162,14 +228,11 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.source = self.root / "Original song.wav"
-        sf.write(self.source, np.sin(np.arange(48000 * 5) * 0.01) * 0.3, 48000, subtype='PCM_24')
+        sf.write(self.source, np.sin(np.arange(48000 * 6) * 0.01) * 0.3, 48000, subtype='PCM_24')
         self.library = self.root / "library"
         self.beats_patch = patch.object(analyze, 'extract_beats', side_effect=detected)
-        self.key_patch = patch.object(analyze, 'detect_key', return_value=None)
-        self.phase_patch = patch.object(analyze, 'detect_first_kick', return_value=1.75)
-        for p in (self.beats_patch, self.key_patch, self.phase_patch):
-            p.start();
-            self.addCleanup(p.stop)
+        self.beats_patch.start()
+        self.addCleanup(self.beats_patch.stop)
 
     def run_import(self, **kwargs):
         return import_track.import_song(self.source, self.library, **kwargs)
@@ -208,12 +271,12 @@ class PipelineTests(unittest.TestCase):
         for name in ('analysis.pcav', 'analysis.json', 'plan_workzones.json'):
             self.assertNotEqual(import_track.sha256_file(folder / name), import_track.sha256_file(revision / name),
                                 name)
-        for directory, downbeat_index, zones in ((folder, 3, []), (revision, 6, ZONED_ZONES)):
+        for directory, downbeat_index, zones in ((folder, 3, []), (revision, 0, ZONED_ZONES)):
             parsed = pcav.read_pcav_file(directory / 'analysis.pcav')
             self.assertEqual(parsed.beats.first_downbeat_index, downbeat_index)
             self.assertEqual(json.loads((directory / 'plan_workzones.json').read_text())['zones'], zones)
             manifest = json.loads((directory / 'manifest.json').read_text())
-            self.assertEqual(manifest['master']['frames'], 240000)
+            self.assertEqual(manifest['master']['frames'], 288000)
             self.assertFalse(manifest['loudness']['normalizationApplied'])
             self.assertEqual(json.loads((directory / 'metadata.json').read_text())['title'], 'Original song')
             for name, record in manifest['artifacts'].items():
@@ -249,7 +312,7 @@ class PipelineTests(unittest.TestCase):
         self.assertRegex(out, f'(?m)^Replaced: .*{h} \\(active analysis updated')
         self.assertNotRegex(out, '(?m)^Revision:')
         self.assertEqual(out.splitlines()[-1], f'Hash: {h}')
-        self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 6)
+        self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 0)
         self.assertEqual(json.loads((folder / 'plan_workzones.json').read_text())['zones'], ZONED_ZONES)
         meta = json.loads((folder / 'metadata.json').read_text())
         self.assertEqual((meta['title'], meta['createdAt']), ('Renamed', created))
@@ -438,11 +501,11 @@ class PipelineTests(unittest.TestCase):
                                  ZONED_ZONES)
 
     def test_beats_outside_duration_and_first_downbeat_snapping(self):
-        for beats in ([0.5, 5.0], [-0.01, 0.5]):
+        for beats in ([0.5, 7.0], [-0.01, 0.5]):
             with patch.object(analyze, 'extract_beats', return_value=(np.array(beats), np.array([1, 2]))):
                 with self.assertRaisesRegex(ValueError, 'Detected beats lie outside audio duration'):
                     self.run_import()
-        for value in (5.0, -0.1, float('nan')):
+        for value in (6.0, -0.1, float('nan')):
             with self.assertRaisesRegex(ValueError, 'First downbeat must identify a beat within the audio'):
                 self.run_import(first_downbeat=value)
         self.assertNothingPublished()
@@ -476,7 +539,7 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'BPM bounds'): self.run_import(min_bpm=180, max_bpm=100)
 
     def test_refuses_short_silent_and_gridless_audio(self):
-        with patch.object(analyze, 'extract_beats', return_value=(np.arange(7) * .5, np.arange(7) % 4 + 1)), \
+        with patch.object(analyze, 'extract_beats', return_value=(np.arange(7) * .5, np.arange(0, 7, 4) * .5)), \
                 self.assertRaisesRegex(analyze.NoBeatGrid, '^no beat grid: 7 beats detected'):
             self.run_import()
         self.assertEqual(list(self.library.iterdir()), [])
@@ -514,14 +577,16 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(hash_decodes.call_count + analysis_decodes.call_count, decodes)
                 self.assertEqual(band_pass.call_count, 1)
                 self.assertEqual(max(Counter(c.args[0] for c in sha256.call_args_list).values()), 1)
-                # One madmom decode (its own ffmpeg resample to 44.1 kHz) feeds both models; one ffmpeg pass over the
+                # The detector reads the samples already decoded for identity, so the only ffmpeg pass over the
                 # master encodes AAC and measures loudness (started with Popen so it overlaps analysis).
-                self.assertIs(analyze.extract_beats.call_args.args[0], analyze.detect_key.call_args.args[0])
+                samples, rate = analyze.extract_beats.call_args.args[:2]
+                self.assertIsInstance(samples, np.ndarray)
+                self.assertAlmostEqual(len(samples) / rate, 6, delta=0.1)
                 spawned = [c.args[0] for c in run.call_args_list + popen.call_args_list]
                 masters = [argv for argv in spawned if
                            '-i' in argv and Path(argv[argv.index('-i') + 1]).name == 'original.wav']
                 encodes = [argv for argv in masters if 'aac' in argv]
-                self.assertEqual(len(masters), 2, masters)
+                self.assertEqual(len(masters), 1, masters)
                 self.assertEqual(len(encodes), 1)
                 self.assertIn('ebur128=peak=true:framelog=quiet', encodes[0])
 

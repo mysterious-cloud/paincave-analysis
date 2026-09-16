@@ -4,29 +4,35 @@ Audio analysis for Pain Cave spin class workouts.
 
 Extracts:
 - Beat grid with downbeats and bar positions
-- Time-varying tempo curve
 - Work zones (regions with consistent kicks vs breakdowns)
-- Musical key
+
+Beats come from the Beat This! detector (CPJKU, MIT); a constant-tempo grid is fitted on top of its
+detections, because plans are bar ranges over an unbroken grid and the detector emits nothing in quiet
+intros and breakdowns.
 
 Output uses camelCase JSON keys for direct consumption by TypeScript.
 """
 
 import argparse
-import concurrent.futures
+import functools
 import json
+import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from scipy import signal
-from scipy.ndimage import median_filter
 
+import models
 from content_hash import load_audio_samples
 
 MIN_DURATION_SECONDS = 1
 MIN_BEATS = 8  # two bars of 4/4: a tempo median, a downbeat and one complete bar
+BEATS_PER_BAR = 4
+MAX_GRID_RESIDUAL_MS = 60  # above this the detections do not describe one constant tempo
 
 
 class NoBeatGrid(ValueError):
@@ -57,139 +63,181 @@ def require_sound(audio: np.ndarray, sr: int) -> None:
         raise NoBeatGrid("audio is digital silence")
 
 
-def extract_beats(audio: Path | np.ndarray, min_bpm: int = 100, max_bpm: int = 180) -> tuple[np.ndarray, np.ndarray]:
-    """Extract beats and downbeats using madmom; `audio` is a file path or a 44.1 kHz mono madmom Signal."""
-    print("Extracting beats with madmom...")
+@functools.cache
+def load_detector(checkpoint: str = models.CHECKPOINT):
+    """Load the Beat This! detector once per process; the checkpoint downloads into the torch hub cache."""
+    import torch
+    from beat_this.inference import Audio2Beats
 
-    from madmom.features.downbeats import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor
-
-    # The ensemble of 8 BLSTMs runs one per process; predictions are averaged in fixed order, so the
-    # result is identical to a serial run. Each network is a Python-level recurrence, so threads can't help.
-    rnn = RNNDownBeatProcessor(num_threads=min(8, os.cpu_count() or 1))
-    activations = rnn(audio if isinstance(audio, np.ndarray) else str(audio))
-
-    # DBN processor for beat tracking
-    dbn = DBNDownBeatTrackingProcessor(
-        beats_per_bar=[4],  # 4/4 time for EDM
-        min_bpm=min_bpm,
-        max_bpm=max_bpm,
-        fps=100
-    )
-
-    # Returns array of [time, beat_position] where beat_position is 1-4
-    beat_data = dbn(activations)
-
-    if len(beat_data) == 0:
-        return np.array([], dtype=float), np.array([], dtype=int)
-
-    beat_times = beat_data[:, 0]
-    beat_positions = beat_data[:, 1].astype(int)
-
-    print(f"Detected {len(beat_times)} beats")
-
-    return beat_times, beat_positions
+    torch.set_num_threads(min(8, os.cpu_count() or 1))
+    return Audio2Beats(checkpoint_path=checkpoint, device="cpu", dbn=False)
 
 
-def detect_key(audio: Path | np.ndarray) -> str | None:
-    """Detect musical key using madmom CNN; `audio` is a file path or a 44.1 kHz mono madmom Signal."""
-    print("Detecting key...")
-    key_start = time.monotonic()
+def extract_beats(audio: np.ndarray, sr: int, min_bpm: int = 100, max_bpm: int = 180) -> tuple[
+    np.ndarray, np.ndarray]:
+    """Detect beats and downbeats in already-decoded mono samples (Beat This! resamples to 22.05 kHz itself).
 
-    try:
-        from madmom.features.key import CNNKeyRecognitionProcessor, key_prediction_to_label
+    Times are quantized to the detector's 20 ms frames and stop wherever it hears no beat; the tempo bounds
+    apply to `fit_beat_grid`, which turns these detections into the continuous grid the app rides on.
+    """
+    print("Extracting beats with Beat This!...")
 
-        proc = CNNKeyRecognitionProcessor()
-        probs = proc(audio if isinstance(audio, np.ndarray) else str(audio))
-        key = key_prediction_to_label(probs)
+    beats, downbeats = load_detector()(audio, sr)
+    beats, downbeats = np.asarray(beats, dtype=float), np.asarray(downbeats, dtype=float)
 
-        print(f"Key: {key}")
-        print(f"timing: key {time.monotonic() - key_start:.1f}s", file=sys.stderr)
-        return key
-    except Exception as e:
-        print(f"Warning: Key detection failed: {e}")
-        return None
+    print(f"Detected {len(beats)} beats, {len(downbeats)} downbeats")
+
+    return beats, downbeats
 
 
-def correct_octave_errors(bpm_curve: np.ndarray, reference_bpm: float, tolerance: float = 0.25) -> np.ndarray:
-    """Correct octave errors in BPM detection."""
-    corrected = bpm_curve.copy()
+@dataclass(frozen=True)
+class GridFit:
+    """One constant-tempo beat grid fitted to detections, covering the whole track."""
 
-    for i, bpm in enumerate(bpm_curve):
-        ratio = bpm / reference_bpm
+    period: float           # seconds per beat
+    phase: float            # time of grid index 0; may lie before the audio
+    beat_times: np.ndarray  # every grid beat with 0 <= t < duration
+    heard: np.ndarray       # per grid beat: a detection landed on it
+    bar_phase: int          # grid index modulo 4 that carries the downbeats
+    residual_ms: float      # RMS distance between heard grid beats and their detections
 
-        if 1 - tolerance <= ratio <= 1 + tolerance:
-            continue
+    @property
+    def bpm(self) -> float:
+        return 60 / self.period
 
-        if 1.8 <= ratio <= 2.3:
-            corrected[i] = bpm / 2
-        elif 0.4 <= ratio <= 0.55:
-            corrected[i] = bpm * 2
-        elif 1.2 <= ratio <= 1.45:
-            corrected[i] = bpm * 3 / 4
-        elif 1.45 < ratio < 1.8:
-            corrected[i] = bpm * 2 / 3
-
-    return corrected
-
-
-def compute_tempo_curve(beat_times: np.ndarray, window: int = 8, reference_bpm: float | None = None) -> tuple[
-    np.ndarray, list[dict]]:
-    """Compute local BPM from beat intervals."""
-    print("Computing tempo curve...")
-
-    intervals = np.diff(beat_times)
-    if not np.isfinite(beat_times).all() or np.any(intervals <= 0):
-        raise ValueError("Beat times must be finite and strictly increasing")
-    if len(intervals) == 0:
-        return np.array([], dtype=float), []
-    local_bpm = 60 / intervals
-
-    smoothed_bpm = median_filter(local_bpm, size=window)
-
-    if reference_bpm:
-        initial_global = reference_bpm
-        print(f"Using reference BPM: {reference_bpm:.1f}")
-    else:
-        initial_global = float(np.percentile(smoothed_bpm, 25))
-
-    corrected_bpm = correct_octave_errors(smoothed_bpm, initial_global)
-    corrected_bpm = median_filter(corrected_bpm, size=window)
-
-    segments = detect_tempo_segments(corrected_bpm, threshold=3.0)
-
-    global_bpm = float(np.median(corrected_bpm))
-    print(f"Global BPM: {global_bpm:.1f}")
-
-    return corrected_bpm, segments
+    @property
+    def index(self) -> np.ndarray:
+        """Grid index of each beat time, counted from `phase`."""
+        return np.rint((self.beat_times - self.phase) / self.period).astype(int)
 
 
-def detect_tempo_segments(bpm_curve: np.ndarray, threshold: float = 3.0) -> list[dict]:
-    """Detect segments where tempo is stable."""
-    segments = []
-    if len(bpm_curve) == 0:
-        return segments
-    current_start = 0
-    current_bpm = bpm_curve[0]
+def _nearest_index(values: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """For each target, the index of the closest of the (sorted, nonempty) values."""
+    after = np.searchsorted(values, targets)
+    left = np.clip(after - 1, 0, len(values) - 1)
+    right = np.clip(after, 0, len(values) - 1)
+    return np.where(np.abs(targets - values[left]) <= np.abs(targets - values[right]), left, right)
 
-    for i, bpm in enumerate(bpm_curve):
-        if abs(bpm - current_bpm) > threshold:
-            if i > current_start:
-                segments.append({
-                    "start_beat": int(current_start),
-                    "end_beat": int(i),
-                    "bpm": round(float(np.median(bpm_curve[current_start:i])), 1)
-                })
-            current_start = i
-            current_bpm = bpm
 
-    if len(bpm_curve) > current_start:
-        segments.append({
-            "start_beat": int(current_start),
-            "end_beat": int(len(bpm_curve)),
-            "bpm": round(float(np.median(bpm_curve[current_start:])), 1)
-        })
+def _fit_line(k: np.ndarray, t: np.ndarray) -> tuple[float, float]:
+    """Least-squares t = t0 + k·period, computed in closed form so the result never depends on a BLAS."""
+    spread = k - k.mean()
+    variance = float(spread @ spread)
+    if variance <= 0:
+        raise NoBeatGrid("no beat grid: every detection falls on one beat position")
+    period = float(spread @ (t - t.mean()) / variance)
+    return period, float(t.mean() - period * k.mean())
 
-    return segments
+
+def _beat_indices(beats: np.ndarray, period: float) -> np.ndarray:
+    """Number the detections, counting beats from one detection to the next.
+
+    Stepping locally keeps an imprecise starting period (the median of 20 ms-quantized intervals is a
+    multiple of 20 ms) from accumulating into a misnumbered beat halfway through the track. Detections
+    closer together than half a period share an index, so a double-tempo reading collapses onto the
+    octave-corrected grid instead of stretching it.
+    """
+    return np.concatenate([[0.0], np.cumsum(np.round(np.diff(beats) / period))])
+
+
+def _octave_correct(period: float, min_bpm: float, max_bpm: float) -> float:
+    """Halve or double the period until its tempo lies within the bounds."""
+    for _ in range(8):
+        if 60 / period > max_bpm:
+            period *= 2
+        elif 60 / period < min_bpm:
+            period /= 2
+        else:
+            return period
+    raise NoBeatGrid(f"no beat grid: tempo {60 / period:.1f} BPM outside {min_bpm}-{max_bpm} BPM")
+
+
+def fit_beat_grid(
+        det_beats: np.ndarray,
+        det_downbeats: np.ndarray,
+        duration: float,
+        min_bpm: int = 100,
+        max_bpm: int = 180,
+) -> GridFit:
+    """Fit one constant-tempo grid to the detections and extend it across the whole track.
+
+    SUNO masters hold a single tempo, so one period and phase describe the track; a track that really
+    changes tempo is fitted to its median period and rejected once the residual grows past
+    MAX_GRID_RESIDUAL_MS. Detections are quantized to 20 ms frames, but the least-squares refit over
+    hundreds of them recovers a period far finer than one frame.
+    """
+    beats = np.sort(np.asarray(det_beats, dtype=float))
+    if len(beats) < MIN_BEATS or not np.isfinite(beats).all():
+        raise NoBeatGrid(f"no beat grid: {len(beats)} usable beat detections; at least {MIN_BEATS} required")
+    if not math.isfinite(duration) or duration <= 0:
+        raise NoBeatGrid("no beat grid: audio has no positive duration")
+
+    intervals = np.diff(beats)
+    # Half-tempo and double-tempo spacings stay in: the octave correction below decides between them.
+    plausible = intervals[(intervals >= 30 / max_bpm) & (intervals <= 120 / min_bpm)]
+    if not len(plausible):
+        raise NoBeatGrid(f"no beat grid: beat spacing implies a tempo far outside {min_bpm}-{max_bpm} BPM")
+    period = _octave_correct(float(np.median(plausible)), min_bpm, max_bpm)
+
+    inliers = beats
+    for _ in range(3):
+        k = _beat_indices(inliers, period)
+        period, t0 = _fit_line(k, inliers)
+        keep = np.abs(inliers - (t0 + k * period)) <= 0.2 * period
+        if keep.all():
+            break
+        inliers = inliers[keep]
+        if len(inliers) < MIN_BEATS:
+            raise NoBeatGrid(f"no beat grid: only {len(inliers)} detections fit one constant tempo; "
+                             f"at least {MIN_BEATS} required")
+    else:  # the last pass dropped outliers, so refit without them
+        k = _beat_indices(inliers, period)
+        period, t0 = _fit_line(k, inliers)
+    if not min_bpm <= 60 / period <= max_bpm:
+        raise NoBeatGrid(f"no beat grid: fitted tempo {60 / period:.1f} BPM outside {min_bpm}-{max_bpm} BPM")
+
+    index = np.arange(math.ceil(-t0 / period), math.floor((duration - t0) / period) + 1)
+    grid = t0 + index * period
+    inside = (grid >= 0) & (grid < duration)
+    index, grid = index[inside], grid[inside]
+    if len(grid) < MIN_BEATS:
+        raise NoBeatGrid(f"no beat grid: {len(grid)} beats fit in {duration:.1f} s at {60 / period:.1f} BPM")
+
+    tolerance = max(0.07, 0.2 * period)
+    offset = grid - beats[_nearest_index(beats, grid)]
+    heard = np.abs(offset) <= tolerance
+    if not heard.any():
+        raise NoBeatGrid("no beat grid: the fitted grid matches none of the detections")
+    residual_ms = float(np.sqrt(np.mean(offset[heard] ** 2)) * 1000)
+    if residual_ms > MAX_GRID_RESIDUAL_MS:
+        raise NoBeatGrid(f"no beat grid: detections scatter {residual_ms:.0f} ms around the fitted "
+                         f"{60 / period:.1f} BPM grid; at most {MAX_GRID_RESIDUAL_MS} ms allowed")
+
+    return GridFit(period, t0, grid, heard, _vote_bar_phase(index, grid, det_downbeats, tolerance, heard),
+                   residual_ms)
+
+
+def _vote_bar_phase(index: np.ndarray, grid: np.ndarray, det_downbeats, tolerance: float,
+                    heard: np.ndarray) -> int:
+    """The grid index modulo 4 that most detected downbeats land on, each weighted by how close it lands."""
+    downbeats = np.asarray(det_downbeats, dtype=float)
+    votes = np.zeros(BEATS_PER_BAR)
+    if len(downbeats):
+        nearest = _nearest_index(grid, downbeats)
+        distance = np.abs(downbeats - grid[nearest])
+        near = distance <= tolerance
+        for phase, weight in zip(index[nearest[near]] % BEATS_PER_BAR, 1 - distance[near] / (2 * tolerance)):
+            votes[phase] += weight
+    if not votes.any():  # no downbeats survived: bar 1 starts on the first beat actually heard
+        return int(index[np.argmax(heard)] % BEATS_PER_BAR)
+    return int(np.argmax(votes))
+
+
+def first_bar_time(fit: GridFit) -> float:
+    """Bar 1: the first grid beat on the voted downbeat phase at or after the first heard beat."""
+    first_heard = int(np.argmax(fit.heard))
+    on_phase = np.flatnonzero((fit.index % BEATS_PER_BAR == fit.bar_phase) & (np.arange(len(fit.index)) >= first_heard))
+    return float(fit.beat_times[on_phase[0] if len(on_phase) else first_heard])
 
 
 def band_pass(audio: np.ndarray, sr: int, low: int = 20, high: int = 150) -> np.ndarray:
@@ -303,101 +351,6 @@ def detect_kick_zones(
     return work_zones
 
 
-def detect_first_kick(
-        bass: np.ndarray,
-        sr: int,
-        beat_times: np.ndarray,
-        beat_positions: np.ndarray
-) -> float:
-    """
-    Detect the correct first downbeat by analyzing where kick patterns start.
-
-    In EDM, kick patterns typically start on beat 1 (downbeat). If madmom's
-    downbeat detection is off, we correct it by finding where kicks actually
-    start in the loudest section and aligning to that.
-    """
-    print("Detecting first kick for bar alignment...")
-
-    envelope = np.abs(bass)
-    smooth_samples = int(0.01 * sr)
-    envelope = np.convolve(envelope, np.ones(smooth_samples) / smooth_samples, mode='same')
-
-    # Find the loudest section (likely the main drop/chorus with kicks)
-    duration = len(bass) / sr
-    window_sec = 10  # Analyze 10-second windows
-    window_samples = window_sec * sr
-    max_energy = 0
-    loudest_start = 0
-
-    for start in range(0, len(envelope) - window_samples, window_samples // 2):
-        energy = np.mean(envelope[start:start + window_samples])
-        if energy > max_energy:
-            max_energy = energy
-            loudest_start = start
-
-    loudest_start_time = loudest_start / sr
-    loudest_end_time = min(loudest_start_time + window_sec, duration)
-    print(f"  Analyzing loudest section: {loudest_start_time:.1f}s - {loudest_end_time:.1f}s")
-
-    # Find beats in the loudest section and check which position has kick onsets
-    kick_threshold = np.max(envelope) * 0.4
-    beat_energies = {1: [], 2: [], 3: [], 4: []}
-
-    for t, pos in zip(beat_times, beat_positions):
-        if loudest_start_time < t < loudest_end_time:
-            sample_idx = int(t * sr)
-            # Check for kick onset (sharp rise in bass energy)
-            window = int(0.05 * sr)
-            if sample_idx + window < len(envelope):
-                peak = np.max(envelope[sample_idx:sample_idx + window])
-                beat_energies[int(pos)].append(peak)
-
-    # In 4-on-the-floor EDM, all beats should have kicks
-    # But the FIRST kick of a phrase should be on beat 1
-    # Check where kick patterns START (transitions from quiet to loud)
-
-    # Find kick onset points (first beat where energy goes above threshold)
-    onset_positions = []
-    prev_loud = False
-    for t, pos in zip(beat_times, beat_positions):
-        sample_idx = int(t * sr)
-        if sample_idx + int(0.05 * sr) < len(envelope):
-            peak = np.max(envelope[sample_idx:sample_idx + int(0.05 * sr)])
-            is_loud = peak > kick_threshold
-
-            if is_loud and not prev_loud:
-                onset_positions.append(int(pos))
-            prev_loud = is_loud
-
-    if onset_positions:
-        # Count which beat position kick patterns start on most often
-        from collections import Counter
-        position_counts = Counter(onset_positions)
-        most_common_onset = position_counts.most_common(1)[0][0]
-        print(f"  Kick patterns start on beat position: {most_common_onset} (count: {position_counts})")
-
-        # If kicks consistently start on beat 3 (should be beat 1), shift by 2
-        if most_common_onset == 3:
-            # Find first downbeat and shift back by 2 beats
-            downbeat_indices = np.where(beat_positions == 1)[0]
-            if len(downbeat_indices) > 0 and downbeat_indices[0] >= 2:
-                # The actual first downbeat should be 2 beats earlier
-                corrected_idx = downbeat_indices[0] - 2
-                corrected_time = beat_times[corrected_idx]
-                print(f"  Correcting downbeat: madmom says {beat_times[downbeat_indices[0]]:.3f}s, "
-                      f"adjusted to {corrected_time:.3f}s")
-                return float(corrected_time)
-
-    # Default: use madmom's first downbeat
-    downbeat_mask = beat_positions == 1
-    if np.any(downbeat_mask):
-        first_downbeat = beat_times[downbeat_mask][0]
-        print(f"  Using madmom's first downbeat: {first_downbeat:.3f}s")
-        return float(first_downbeat)
-
-    return beat_times[0] if len(beat_times) > 0 else 0.0
-
-
 def compute_beat_confidence(beat_times: np.ndarray, expected_bpm: float) -> np.ndarray:
     """Compute confidence score for each beat based on interval consistency."""
     if len(beat_times) < 2:
@@ -424,56 +377,23 @@ def compute_beat_confidence(beat_times: np.ndarray, expected_bpm: float) -> np.n
 
 def build_beats_array(
         beat_times: np.ndarray,
-        beat_positions: np.ndarray,
-        first_downbeat_t: float | None = None,
+        first_downbeat_t: float,
         confidences: np.ndarray | None = None
 ) -> list[dict]:
-    """Build the beats array with bar and beat information."""
+    """Number the grid: bar 1 starts at the first downbeat, earlier beats are pickups in bar 0."""
+    if not len(beat_times):
+        return []
+    first = int(np.argmin(np.abs(np.asarray(beat_times, dtype=float) - first_downbeat_t)))
     beats = []
-
-    if first_downbeat_t is not None and len(beat_times) > 0:
-        distances = np.abs(beat_times - first_downbeat_t)
-        first_downbeat_idx = np.argmin(distances)
-
-        bar_num = 1
-        beat_in_bar = 1
-
-        for i, time in enumerate(beat_times):
-            conf = confidences[i] if confidences is not None else 1.0
-
-            if i < first_downbeat_idx:
-                pickup_beat = (i - first_downbeat_idx) % 4 + 1
-                beats.append({
-                    "t": round(float(time), 3),
-                    "bar": 0,
-                    "beat": int(pickup_beat),
-                    "confidence": round(float(conf), 2)
-                })
-            else:
-                position_from_first = i - first_downbeat_idx
-                bar_num = (position_from_first // 4) + 1
-                beat_in_bar = (position_from_first % 4) + 1
-
-                beats.append({
-                    "t": round(float(time), 3),
-                    "bar": int(bar_num),
-                    "beat": int(beat_in_bar),
-                    "confidence": round(float(conf), 2)
-                })
-    else:
-        bar_num = 1
-        for i, (time, pos) in enumerate(zip(beat_times, beat_positions)):
-            if pos == 1 and len(beats) > 0:
-                bar_num += 1
-
-            conf = confidences[i] if confidences is not None else 1.0
-            beats.append({
-                "t": round(float(time), 3),
-                "bar": bar_num,
-                "beat": int(pos),
-                "confidence": round(conf, 2)
-            })
-
+    for i, t in enumerate(beat_times):
+        offset = i - first
+        confidence = float(confidences[i]) if confidences is not None else 1.0
+        beats.append({
+            "t": round(float(t), 3),
+            "bar": max(0, offset // BEATS_PER_BAR + 1),
+            "beat": int(offset % BEATS_PER_BAR + 1),
+            "confidence": round(confidence, 2),
+        })
     return beats
 
 
@@ -481,74 +401,77 @@ def analyze_audio(
         audio_path: Path,
         min_bpm: int = 100,
         max_bpm: int = 180,
-        reference_bpm: float | None = None,
         first_downbeat: float | None = None,
         audio: tuple[np.ndarray, int] | None = None,
+        grid_out: dict | None = None,
 ) -> dict:
-    """Main analysis pipeline. `audio` is the file's already decoded (samples, rate), if any."""
+    """Main analysis pipeline. `audio` is the file's already decoded (samples, rate), if any.
+
+    `grid_out`, when given, collects grid-fit diagnostics for the manifest; the returned analysis
+    itself carries only the fields the shared schema allows.
+    """
 
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
-    if reference_bpm is not None and (not np.isfinite(reference_bpm) or reference_bpm <= 0):
-        raise ValueError("Reference BPM must be finite and positive")
     audio, sr = audio if audio is not None else load_audio(audio_path)
     duration = len(audio) / sr
     require_sound(audio, sr)
 
-    from madmom.audio.signal import Signal
-    # One 44.1 kHz mono decode feeds both models; each would otherwise decode the file itself.
-    madmom_signal = Signal(str(audio_path), sample_rate=44100, num_channels=1)
-    # Key detection (single CNN) runs on a thread while beat tracking waits on its worker processes.
-    # Both only read the signal; the module-level name is looked up at call time so tests can stub it.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        key_future = executor.submit(lambda: detect_key(madmom_signal))
-        beats_start = time.monotonic()
-        beat_times, beat_positions = extract_beats(madmom_signal, min_bpm, max_bpm)
-        print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
-        key = key_future.result()
+    beats_start = time.monotonic()
+    det_beats, det_downbeats = extract_beats(audio, sr, min_bpm, max_bpm)
+    print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
 
-    if np.any(beat_times < 0) or np.any(beat_times >= duration):
+    if np.any(det_beats < 0) or np.any(det_beats >= duration):
         raise ValueError("Detected beats lie outside audio duration")
-    if len(beat_times) < MIN_BEATS:
+    if len(det_beats) < MIN_BEATS:
         raise NoBeatGrid(
-            f"no beat grid: {len(beat_times)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
+            f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
 
-    tempo_curve, tempo_segments = compute_tempo_curve(beat_times, reference_bpm=reference_bpm)
-    global_bpm = float(np.median(tempo_curve))
+    fit = fit_beat_grid(det_beats, det_downbeats, duration, min_bpm, max_bpm)
+    inferred = int((~fit.heard).sum())
+    print(f"Grid: {fit.bpm:.1f} BPM, {len(fit.beat_times)} beats ({inferred} inferred), "
+          f"residual {fit.residual_ms:.1f} ms")
 
     zones_start = time.monotonic()
-    # One 20-150 Hz filter pass feeds both bar energy and downbeat alignment.
     bass = band_pass(audio, sr)
     low_band = compute_band_energy(bass, sr)
 
     if first_downbeat is not None:
         if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration:
             raise ValueError("First downbeat must identify a beat within the audio")
-        first_downbeat_t = float(beat_times[np.argmin(np.abs(beat_times - first_downbeat))])
+        first_downbeat_t = float(fit.beat_times[np.argmin(np.abs(fit.beat_times - first_downbeat))])
         print(f"Using user-specified first downbeat: {first_downbeat_t:.3f}s")
     else:
-        first_downbeat_t = detect_first_kick(bass, sr, beat_times, beat_positions)
+        first_downbeat_t = first_bar_time(fit)
 
-    beat_confidences = compute_beat_confidence(beat_times, global_bpm)
+    # A grid beat with no detection under it is a guess the app should be able to tell apart.
+    confidences = compute_beat_confidence(fit.beat_times, fit.bpm)
+    confidences = np.where(fit.heard, confidences, np.minimum(confidences, 0.5))
 
-    beats_data = build_beats_array(beat_times, beat_positions, first_downbeat_t, beat_confidences)
+    beats_data = build_beats_array(fit.beat_times, first_downbeat_t, confidences)
 
     kick_density, kick_bar_info = compute_kick_density(low_band, beats_data, duration)
 
     work_zones = detect_kick_zones(kick_density, kick_bar_info, duration=duration)
     print(f"timing: bass+zones {time.monotonic() - zones_start:.1f}s", file=sys.stderr)
 
+    if grid_out is not None:
+        grid_out.update(
+            detectedBeatCount=len(det_beats), detectedDownbeatCount=len(det_downbeats),
+            inferredBeatCount=inferred, residualMs=round(fit.residual_ms, 2), barPhase=fit.bar_phase,
+        )
+
     return {
         "version": "3.0",
         "duration": duration,
         "sampleRate": sr,
-        "bpm": round(global_bpm, 1),
-        "key": key,
+        "bpm": round(fit.bpm, 1),
+        "key": None,
         "firstDownbeat": round(first_downbeat_t, 3),
         "beats": beats_data,
         "workZones": work_zones,
         "raw": {
-            "beatTimes": [round(float(t), 3) for t in beat_times],
+            "beatTimes": [b["t"] for b in beats_data],
             "bassEnergy": [round(float(v), 4) for v in low_band],
         },
     }
@@ -572,18 +495,13 @@ def main():
         "--min-bpm",
         type=int,
         default=100,
-        help="Minimum BPM for beat tracking (default: 100)"
+        help="Minimum BPM for the fitted beat grid (default: 100)"
     )
     parser.add_argument(
         "--max-bpm",
         type=int,
         default=180,
-        help="Maximum BPM for beat tracking (default: 180)"
-    )
-    parser.add_argument(
-        "--reference-bpm",
-        type=float,
-        help="Reference BPM from DAW (e.g., Ableton) for octave error correction"
+        help="Maximum BPM for the fitted beat grid (default: 180)"
     )
     parser.add_argument(
         "--first-downbeat",
@@ -601,7 +519,6 @@ def main():
         args.input,
         min_bpm=args.min_bpm,
         max_bpm=args.max_bpm,
-        reference_bpm=args.reference_bpm,
         first_downbeat=args.first_downbeat,
     )
 

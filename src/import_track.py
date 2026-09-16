@@ -36,6 +36,7 @@ from pathlib import Path
 
 import jsonschema
 
+import models
 from analyze import NoBeatGrid, analyze_audio, load_audio, require_sound
 from content_hash import compute_content_hash, fingerprint
 from pcav import (
@@ -426,12 +427,13 @@ def import_song(
         elif explicit_source and source_file != audio_path:
             raise ValueError("A derived master requires --processing-record provenance")
 
-        # The streaming encode runs on its own core while madmom works; collected before the manifest.
+        # The streaming encode runs on its own core while the detector works; collected before the manifest.
         with background_encode(original_wav, stage / "audio.m4a") as encode:
             if captured_input != original_wav:  # the decoded input was compressed; analysis reads the master
                 samples, sample_rate = load_audio(original_wav)
+            grid_metrics: dict = {}
             analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat,
-                                     audio=(samples, sample_rate))
+                                     audio=(samples, sample_rate), grid_out=grid_metrics)
             validate_json(analysis, "analysis")
             info = sf.info(original_wav)
             if analysis["duration"] != info.frames / info.samplerate or analysis["sampleRate"] != sample_rate:
@@ -484,7 +486,7 @@ def import_song(
             if abs(float(playback["duration"]) - info.frames / info.samplerate) > 0.05:
                 raise ValueError("Playback duration differs from analyzed master by more than 50 ms")
             versions = {}
-            for package in ("numpy", "scipy", "soundfile", "madmom"):
+            for package in ("numpy", "scipy", "soundfile", "beat_this", "torch"):
                 try:
                     versions[package] = importlib.metadata.version(package)
                 except importlib.metadata.PackageNotFoundError:
@@ -506,15 +508,16 @@ def import_song(
                     "loudness": loudness,
                     "grid": {"firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
                              "beatCount": len(beat_times), "firstBeat": beat_times[0], "lastBeat": beat_times[-1],
-                             "confidenceKind": "interval-regularity",
-                             "meanIntervalConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(
-                                 beat_times)},
+                             "confidenceKind": "grid-heard",
+                             "meanConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times),
+                             **grid_metrics},
                     "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat,
+                               "beatCheckpoint": models.checkpoint_info(),
                                "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
                                "loudnessFilter": "ebur128=peak=true"},
                     "tools": versions,
                     "toolSources": {name: sha256_file(Path(__file__).parent / name) for name in
-                                    ("analyze.py", "pcav.py", "import_track.py", "content_hash.py")},
+                                    ("analyze.py", "models.py", "pcav.py", "import_track.py", "content_hash.py")},
                     "artifacts": {p.name: {"sha256": sha(p), "bytes": p.stat().st_size} for p in
                                   sorted(stage.iterdir())},
                 }
@@ -548,7 +551,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Import songs into the Pain Cave track library"
     )
-    parser.add_argument("audio_file", type=Path, help="Path to audio file")
+    parser.add_argument("audio_file", type=Path, nargs="?", help="Path to audio file")
     parser.add_argument("--library", type=Path, default=DEFAULT_TRACKS_DIR,
                         help="Track library directory (default: $PAINCAVE_TRACKS_DIR)")
     parser.add_argument("-t", "--title", type=str, help="Track title (default: filename)")
@@ -566,9 +569,19 @@ def main():
 
     parser.add_argument("--source-file", type=Path, help="Retain the unprocessed source download")
     parser.add_argument("--processing-record", type=Path, help="Audio preparation provenance JSON")
-    parser.add_argument("--first-downbeat", type=float, help="Override bar 1 start (snapped to nearest detected beat)")
+    parser.add_argument("--first-downbeat", type=float, help="Override bar 1 start (snapped to nearest grid beat)")
+    parser.add_argument("--check-model", action="store_true",
+                        help="Print the beat detector checkpoint (downloading it if needed) and exit")
     args = parser.parse_args()
 
+    if args.check_model:
+        checkpoint = models.ensure_checkpoint()
+        print(f"beat_this {importlib.metadata.version('beat_this')}, torch {importlib.metadata.version('torch')}")
+        print(f"checkpoint {checkpoint['name']}: {checkpoint['file']}\n  sha256 {checkpoint['sha256']}")
+        return
+
+    if args.audio_file is None:
+        raise SystemExit("Error: audio_file is required")
     if not args.audio_file.exists():
         print(f"Error: File not found: {args.audio_file}", file=sys.stderr)
         sys.exit(1)

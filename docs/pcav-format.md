@@ -21,7 +21,7 @@ All sections remain optional. v2 timestamps must be strictly increasing, finite,
 
 `durationSeconds:float64, bpmTimes10:uint16, key:uint8, reserved:uint8`
 
-Duration is measured frames / sample rate, without whole-second rounding. BPM 0 means unknown (for example silence or insufficient beats). Reserved byte is zero. Duration must be positive and finite.
+Duration is measured frames / sample rate, without whole-second rounding. BPM 0 means unknown (for example silence or insufficient beats). Key is always 0x00 (unknown) for tracks analyzed after 2026-09-15: key detection went away with madmom. Reserved byte is zero. Duration must be positive and finite.
 
 **Key Encoding:**
 
