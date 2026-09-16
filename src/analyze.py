@@ -17,7 +17,6 @@ import argparse
 import functools
 import json
 import math
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -30,6 +29,8 @@ import models
 from content_hash import load_audio_samples
 
 MIN_DURATION_SECONDS = 1
+DETECTOR_THREADS = 4  # fixed, not the host's core count: the reduction order must not vary by machine
+DETECTOR_FRAME_SECONDS = 0.02  # the detector reports beats on a 50 fps frame grid
 MIN_BEATS = 8  # two bars of 4/4: a tempo median, a downbeat and one complete bar
 BEATS_PER_BAR = 4
 MAX_GRID_RESIDUAL_MS = 60  # above this the detections do not describe a rideable grid
@@ -71,16 +72,16 @@ def load_detector(checkpoint: str = models.CHECKPOINT):
     import torch
     from beat_this.inference import Audio2Beats
 
-    torch.set_num_threads(min(8, os.cpu_count() or 1))
+    torch.set_num_threads(DETECTOR_THREADS)
     return Audio2Beats(checkpoint_path=checkpoint, device="cpu", dbn=False)
 
 
-def extract_beats(audio: np.ndarray, sr: int, min_bpm: int = 100, max_bpm: int = 180) -> tuple[
-    np.ndarray, np.ndarray]:
+def extract_beats(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
     """Detect beats and downbeats in already-decoded mono samples (Beat This! resamples to 22.05 kHz itself).
 
-    Times are quantized to the detector's 20 ms frames and stop wherever it hears no beat; the tempo bounds
-    apply to `fit_beat_grid`, which turns these detections into the continuous grid the app rides on.
+    Times are quantized to the detector's 20 ms frames and stop wherever it hears no beat. The detector
+    knows no tempo bounds; those belong to `fit_beat_grid`, which turns these detections into the
+    continuous grid the app rides on.
     """
     print("Extracting beats with Beat This!...")
 
@@ -221,16 +222,16 @@ def _number_and_fit(beats: np.ndarray, period: float) -> tuple[np.ndarray, float
     return k, period, t0
 
 
-def _octave_correct(period: float, min_bpm: float, max_bpm: float) -> float:
+def _octave_correct(period: float, bounds: tuple[float, float]) -> float:
     """Halve or double the period until its tempo lies within the bounds."""
     for _ in range(8):
-        if 60 / period > max_bpm:
+        if 60 / period > bounds[1]:
             period *= 2
-        elif 60 / period < min_bpm:
+        elif 60 / period < bounds[0]:
             period /= 2
         else:
             return period
-    raise NoBeatGrid(f"no beat grid: tempo {60 / period:.1f} BPM outside {min_bpm}-{max_bpm} BPM")
+    raise NoBeatGrid(f"no beat grid: tempo {60 / period:.1f} BPM outside {bounds[0]:.0f}-{bounds[1]:.0f} BPM")
 
 
 def fit_beat_grid(
@@ -260,9 +261,10 @@ def fit_beat_grid(
     plausible = intervals[(intervals >= 30 / max_bpm) & (intervals <= 120 / min_bpm)]
     if not len(plausible):
         raise NoBeatGrid(f"no beat grid: beat spacing implies a tempo far outside {min_bpm}-{max_bpm} BPM")
-    period = _octave_correct(float(np.median(plausible)), min_bpm, max_bpm)
-    # 1% of slack: a grid that follows the drift of a track sitting on a bound may cross it by a hair.
+    # 1% of slack everywhere the bounds are applied: a track sitting on a bound, or a grid that follows
+    # its drift, may cross it by a hair, and 60 / (60 / 100) is not exactly 100.
     bounds = (min_bpm * 0.99, max_bpm * 1.01)
+    period = _octave_correct(float(np.median(plausible)), bounds)
     beats = _drop_offbeats(beats, period)
     if len(beats) < MIN_BEATS:
         raise NoBeatGrid(f"no beat grid: {len(beats)} detections left once off-beats were dropped; "
@@ -282,7 +284,7 @@ def fit_beat_grid(
                              f"at least {MIN_BEATS} required")
     else:  # the last pass dropped outliers, so refit without them
         k, period, t0 = _number_and_fit(inliers, period)
-    if not min_bpm <= 60 / period <= max_bpm:
+    if not bounds[0] <= 60 / period <= bounds[1]:
         raise NoBeatGrid(f"no beat grid: fitted tempo {60 / period:.1f} BPM outside {min_bpm}-{max_bpm} BPM")
 
     index, grid = _grid_times(k, inliers, period, t0, duration, bounds)
@@ -542,11 +544,14 @@ def analyze_audio(
     require_sound(audio, sr)
 
     beats_start = time.monotonic()
-    det_beats, det_downbeats = extract_beats(audio, sr, min_bpm, max_bpm)
+    det_beats, det_downbeats = extract_beats(audio, sr)
     print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
 
-    if np.any(det_beats < 0) or np.any(det_beats >= duration):
-        raise ValueError("Detected beats lie outside audio duration")
+    if np.any(det_beats < 0) or np.any(det_beats > duration + DETECTOR_FRAME_SECONDS):
+        raise NoBeatGrid("Detected beats lie outside audio duration")
+    # A track whose last frame lands on its final beat reports it at the duration; the grid holds beats
+    # strictly inside the audio, so that beat is dropped rather than refused.
+    det_beats, det_downbeats = det_beats[det_beats < duration], det_downbeats[det_downbeats < duration]
     if len(det_beats) < MIN_BEATS:
         raise NoBeatGrid(
             f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")

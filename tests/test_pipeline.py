@@ -242,6 +242,24 @@ class GridFitTests(unittest.TestCase):
         self.assertEqual(len(fit.beat_times), len(plain.beat_times))
         self.assertLess(np.abs(fit.beat_times - plain.beat_times).max(), 0.01)
 
+    def test_tempo_exactly_on_a_bound_is_kept(self):
+        for bpm in (100, 180):
+            for seconds in (30, 47.5, 60):
+                with self.subTest(bpm=bpm, seconds=seconds):
+                    beats = self.detections(int(seconds * bpm / 60), start=0.3, period=60 / bpm)
+                    fit = analyze.fit_beat_grid(beats, beats[::4], seconds + 0.5, min_bpm=100, max_bpm=180)
+                    self.assertAlmostEqual(fit.bpm, bpm, delta=0.2)
+        # Half of a minimum tempo is still corrected back up, and a quarter of it has no grid.
+        slow = self.detections(80, period=2 * 60 / 100)
+        self.assertAlmostEqual(analyze.fit_beat_grid(slow, slow[::4], 120.0).bpm, 100, delta=0.2)
+
+    def test_a_detection_on_the_final_beat_is_kept_not_refused(self):
+        beats = self.detections(60, start=0.0)
+        duration = float(beats[-1])  # the last frame lands exactly on the end of the audio
+        fit = analyze.fit_beat_grid(beats, beats[::4], duration)
+        self.assertLess(fit.beat_times[-1], duration)
+        self.assertEqual(len(fit.beat_times), len(beats) - 1)
+
     def test_too_few_wrong_tempo_or_a_tempo_step_have_no_grid(self):
         # A grid that bends to follow drift cannot follow an edit that changes tempo outright.
         stepped = np.round(np.concatenate([np.arange(0, 60, 0.5), 60 + np.arange(0, 60, 60 / 165)]) / 0.02) * 0.02
@@ -567,6 +585,13 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'First downbeat must identify a beat within the audio'):
                 self.run_import(first_downbeat=value)
         self.assertNothingPublished()
+        # A detection on the last frame is dropped, not refused: a track ending on a beat imports.
+        ending = np.append(np.arange(0.25, 5.8, 0.5), 6.0)
+        with patch.object(analyze, 'extract_beats', return_value=(ending, ending[3::4])):
+            ends_on_beat = self.root / 'ends-on-beat'
+            import_track.import_song(self.source, ends_on_beat)
+            beats = json.loads((next(ends_on_beat.iterdir()) / 'analysis.json').read_text())['beats']
+            self.assertLess(beats[-1]['t'], 6.0)
         folder = self.library / self.run_import(first_downbeat=1.3)
         self.assertEqual(json.loads((folder / 'analysis.json').read_text())['firstDownbeat'], 1.25)
         self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 2)

@@ -37,7 +37,7 @@ from pathlib import Path
 import jsonschema
 
 import models
-from analyze import NoBeatGrid, analyze_audio, load_audio, require_sound
+from analyze import DETECTOR_THREADS, NoBeatGrid, analyze_audio, load_audio, require_sound
 from content_hash import compute_content_hash, fingerprint
 from pcav import (
     PCAVData, AnalysisSection, BeatsSection,
@@ -512,7 +512,7 @@ def import_song(
                              "meanConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times),
                              **grid_metrics},
                     "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat,
-                               "beatCheckpoint": models.checkpoint_info(),
+                               "beatCheckpoint": models.checkpoint_info(), "beatThreads": DETECTOR_THREADS,
                                "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
                                "loudnessFilter": "ebur128=peak=true"},
                     "tools": versions,
@@ -581,7 +581,7 @@ def main():
         return
 
     if args.audio_file is None:
-        raise SystemExit("Error: audio_file is required")
+        parser.error("the following arguments are required: audio_file")
     if not args.audio_file.exists():
         print(f"Error: File not found: {args.audio_file}", file=sys.stderr)
         sys.exit(1)
