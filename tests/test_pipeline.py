@@ -153,6 +153,11 @@ class GridFitTests(unittest.TestCase):
         times = 0.4 + np.concatenate([[0.0], np.cumsum(periods[:-1])])
         return np.round(times / quantize) * quantize, float(times[-1] + periods[-1])
 
+    @staticmethod
+    def off_bar(bars: float) -> float:
+        """How far a distance in bars is from a whole number of bars."""
+        return min(bars % 1, 1 - bars % 1)
+
     def test_gap_is_filled_with_inferred_beats(self):
         beats = np.concatenate([self.detections(24), self.detections(40, start=1.0 + 44 * self.PERIOD)])
         fit = analyze.fit_beat_grid(beats, beats[::4], 60.0)
@@ -211,20 +216,42 @@ class GridFitTests(unittest.TestCase):
             fit = analyze.fit_beat_grid(beats, beats[offset::4], 120.0)
             first = analyze.first_bar_time(fit)
             self.assertEqual(fit.bar_phase, int(fit.index[np.argmin(np.abs(fit.beat_times - beats[offset]))] % 4))
-            self.assertAlmostEqual(first, beats[offset], delta=0.021)
+            # Bar 1 is the earliest grid beat on the voted phase: inside the first bar of audio, and a
+            # whole number of bars before the first detected downbeat.
+            self.assertLess(first, 4 * fit.period)
+            self.assertLess(self.off_bar((beats[offset] - first) / (4 * fit.period)), 0.02)
             numbered = analyze.build_beats_array(fit.beat_times, first)
             self.assertEqual([b['bar'] for b in numbered if b['t'] == round(first, 3)], [1])
-        # Without downbeats, bar 1 falls on the first beat the detector actually heard.
-        self.assertAlmostEqual(analyze.first_bar_time(analyze.fit_beat_grid(beats, [], 120.0)), beats[0], delta=0.021)
+            self.assertLess(sum(b['bar'] == 0 for b in numbered), 4)  # at most three pickup beats
+        # Without downbeats the phase of the first heard beat stands in for the vote.
+        blind = analyze.fit_beat_grid(beats, [], 120.0)
+        self.assertLess(self.off_bar((beats[0] - analyze.first_bar_time(blind)) / (4 * blind.period)), 0.02)
 
-    def test_too_few_or_scattered_detections_have_no_grid(self):
+    def test_half_beat_detections_are_dropped(self):
+        beats = self.detections()
+        early = beats[beats < 20]
+        halves = (early[:-1] + early[1:]) / 2  # the detector doubling up over the first 20 s
+        heard = np.sort(np.concatenate([beats, np.round(halves / 0.02) * 0.02]))
+        self.assertEqual(len(analyze._drop_offbeats(heard, self.PERIOD)), len(beats))
+        fit = analyze.fit_beat_grid(heard, beats[::4], 120.0)
+        plain = analyze.fit_beat_grid(beats, beats[::4], 120.0)
+        low, high = analyze.tempo_range(fit)
+        self.assertAlmostEqual(low, 137.3, delta=0.3)
+        self.assertAlmostEqual(high, 137.3, delta=0.3)
+        self.assertAlmostEqual(analyze.first_bar_time(fit), analyze.first_bar_time(plain), delta=0.021)
+        self.assertEqual(len(fit.beat_times), len(plain.beat_times))
+        self.assertLess(np.abs(fit.beat_times - plain.beat_times).max(), 0.01)
+
+    def test_too_few_wrong_tempo_or_a_tempo_step_have_no_grid(self):
+        # A grid that bends to follow drift cannot follow an edit that changes tempo outright.
+        stepped = np.round(np.concatenate([np.arange(0, 60, 0.5), 60 + np.arange(0, 60, 60 / 165)]) / 0.02) * 0.02
         for beats, message in (
                 (self.detections(5), 'usable beat detections'),
                 (np.arange(20) * 0.05, 'far outside 100-180 BPM'),
-                (np.cumsum(np.concatenate([[1.0], np.tile([0.30, 0.62], 30)])), 'scatter'),
+                (stepped, 'the grid runs'),
         ):
             with self.subTest(message=message), self.assertRaisesRegex(analyze.NoBeatGrid, message):
-                analyze.fit_beat_grid(beats, beats[::4], 120.0)
+                analyze.fit_beat_grid(beats, beats[::4], 121.0)
 
     def test_same_detections_give_the_same_grid(self):
         beats, downbeats = self.detections(), self.detections()[::4]
