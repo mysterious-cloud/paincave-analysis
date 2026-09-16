@@ -36,6 +36,10 @@ BEATS_PER_BAR = 4
 MAX_GRID_RESIDUAL_MS = 60  # above this the detections do not describe a rideable grid
 LOCAL_WINDOWS = (32, 64, 128)  # beats each side of a grid beat: 8, 16 and 32 bars
 LOCAL_MARGIN = 8  # extra beat slots fitted past each end before the grid is trimmed to the audio
+ONSET_RATE = 1000  # onset strength values per second: 1 ms resolution
+KICK_LOW_HZ = 40  # a sub-bass drone rises too slowly to time a beat by; the kick fundamental starts here
+KICK_SEARCH_SECONDS = 0.06  # how far each side of a grid beat its kick is looked for
+KICK_STRENGTH_PERCENTILE = 90  # an onset weaker than this much of the track is not a kick
 
 
 class NoBeatGrid(ValueError):
@@ -104,6 +108,9 @@ class GridFit:
     heard: np.ndarray       # per grid beat: a detection landed on it
     bar_phase: int          # grid index modulo 4 that carries the downbeats
     residual_ms: float      # RMS distance between heard grid beats and their detections
+    kick_aligned: int = 0       # heard beats moved onto a kick onset before the final fit
+    kick_lag_ms: float = 0.0    # median kick-minus-grid lag over those beats, before alignment
+    kick_residual_ms: float = 0.0  # RMS kick-minus-grid lag over those beats, after alignment
 
     @property
     def bpm(self) -> float:
@@ -222,6 +229,37 @@ def _number_and_fit(beats: np.ndarray, period: float) -> tuple[np.ndarray, float
     return k, period, t0
 
 
+def _match_detections(grid: np.ndarray, beats: np.ndarray, tolerance: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per grid beat: the signed distance to the nearest detection, and whether one landed on it."""
+    offset = grid - beats[_nearest_index(beats, grid)]
+    return offset, np.abs(offset) <= tolerance
+
+
+def _kick_align(grid: np.ndarray, detections: np.ndarray, onsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Detection times moved onto the strongest kick onset under their grid beat, and which moved.
+
+    The detector locks a little ahead of or behind the kick in some sections, and a grid fitted to it
+    inherits that; bars have to sit on the kicks. A beat is aligned only when the onset strength within
+    60 ms of it peaks at or above the track's 90th percentile, which is a kick rather than the noise
+    floor of a breakdown; the rest keep the time the detector reported.
+    """
+    times, aligned = np.array(detections, dtype=float), np.zeros(len(grid), bool)
+    if not len(onsets):
+        return times, aligned
+    threshold = float(np.percentile(onsets, KICK_STRENGTH_PERCENTILE))
+    if threshold <= 0:  # a track whose bass barely moves has no kicks to align to
+        return times, aligned
+    reach = round(KICK_SEARCH_SECONDS * ONSET_RATE)
+    for i, centre in enumerate(np.round(grid * ONSET_RATE).astype(int)):
+        lo, hi = max(0, centre - reach), min(len(onsets), centre + reach + 1)
+        if hi <= lo:
+            continue
+        peak = int(onsets[lo:hi].argmax())
+        if onsets[lo + peak] >= threshold:
+            times[i], aligned[i] = (lo + peak) / ONSET_RATE, True
+    return times, aligned
+
+
 def _octave_correct(period: float, bounds: tuple[float, float]) -> float:
     """Halve or double the period until its tempo lies within the bounds."""
     for _ in range(8):
@@ -240,6 +278,7 @@ def fit_beat_grid(
         duration: float,
         min_bpm: int = 100,
         max_bpm: int = 180,
+        onsets: np.ndarray | None = None,
 ) -> GridFit:
     """Fit a beat grid to the detections and extend it across the whole track.
 
@@ -249,6 +288,10 @@ def fit_beat_grid(
     A sudden tempo change is not modelled: the grid bends across it and the residual gate rejects the
     track. Detections are quantized to 20 ms frames, but each local fit over dozens of them recovers a
     period far finer than one frame.
+
+    `onsets`, when given, is `onset_strength` over the track: each heard detection is then moved onto
+    the kick under its grid beat and the grid fitted once more, so the bars sit on the kicks even where
+    the detector heard them a few frames off.
     """
     beats = np.sort(np.asarray(det_beats, dtype=float))
     if len(beats) < MIN_BEATS or not np.isfinite(beats).all():
@@ -303,17 +346,35 @@ def fit_beat_grid(
     _require_rideable(grid, period, duration, bounds)
 
     tolerance = max(0.07, 0.2 * period)
-    offset = grid - beats[_nearest_index(beats, grid)]
-    heard = np.abs(offset) <= tolerance
+    offset, heard = _match_detections(grid, beats, tolerance)
     if not heard.any():
         raise NoBeatGrid("no beat grid: the fitted grid matches none of the detections")
+
+    # Third pass: kick alignment. Where the detector sits beside the kick, its detections carry the grid
+    # with them; each heard beat's detection moves onto the kick under it and the grid is fitted again.
+    aligned_count, kick_lag_ms, kick_residual_ms = 0, 0.0, 0.0
+    if onsets is not None:
+        times, aligned = _kick_align(grid[heard], beats[_nearest_index(beats, grid)][heard], onsets)
+        if aligned.sum() >= MIN_BEATS:
+            lag = times[aligned] - grid[heard][aligned]
+            index, grid = _grid_times(index[heard].astype(float), times, period, t0, duration, bounds)
+            _require_rideable(grid, period, duration, bounds)
+            offset, heard = _match_detections(grid, beats, tolerance)
+            if not heard.any():
+                raise NoBeatGrid("no beat grid: the kick-aligned grid matches none of the detections")
+            kicks = times[aligned]
+            aligned_count = int(aligned.sum())
+            kick_lag_ms = float(np.median(lag) * 1000)
+            kick_residual_ms = float(np.sqrt(np.mean((kicks - grid[_nearest_index(grid, kicks)]) ** 2)) * 1000)
+
     residual_ms = float(np.sqrt(np.mean(offset[heard] ** 2)) * 1000)
     if residual_ms > MAX_GRID_RESIDUAL_MS:
         raise NoBeatGrid(f"no beat grid: detections scatter {residual_ms:.0f} ms around the fitted "
                          f"{60 / period:.1f} BPM grid; at most {MAX_GRID_RESIDUAL_MS} ms allowed")
 
     return GridFit(period, t0, grid, index, heard,
-                   _vote_bar_phase(index, grid, det_downbeats, tolerance, heard), residual_ms)
+                   _vote_bar_phase(index, grid, det_downbeats, tolerance, heard), residual_ms,
+                   aligned_count, round(kick_lag_ms, 2), round(kick_residual_ms, 2))
 
 
 def _require_rideable(grid: np.ndarray, period: float, duration: float, bounds: tuple[float, float] | None) -> None:
@@ -371,6 +432,23 @@ def band_pass(audio: np.ndarray, sr: int, low: int = 20, high: int = 150) -> np.
     nyquist = sr / 2
     sos = signal.butter(4, [low / nyquist, min(high / nyquist, 0.99)], btype='band', output='sos')
     return signal.sosfiltfilt(sos, audio, padlen=min(27, len(audio) - 1))
+
+
+def onset_strength(bass: np.ndarray, sr: int) -> np.ndarray:
+    """Rising kick energy, one value per millisecond, from an already band-passed bass signal.
+
+    The band holds nothing above 150 Hz, so it resamples to 1 kHz without aliasing; a 40 Hz high-pass
+    there drops sub-bass drones, whose slow rise would otherwise blur the attack. The value at index i
+    is how much the analytic envelope rose over the millisecond starting at i ms, floored at zero, so a
+    kick shows as one sharp peak at its attack and a decay shows as nothing.
+    """
+    step = math.gcd(ONSET_RATE, sr)
+    resampled = signal.resample_poly(bass, ONSET_RATE // step, sr // step)
+    if len(resampled) < 2:
+        return np.zeros(len(resampled))
+    sos = signal.butter(4, KICK_LOW_HZ / (ONSET_RATE / 2), btype='high', output='sos')
+    envelope = np.abs(signal.hilbert(signal.sosfiltfilt(sos, resampled, padlen=min(27, len(resampled) - 1))))
+    return np.maximum(np.diff(envelope, prepend=envelope[:1]), 0)
 
 
 def compute_band_energy(filtered: np.ndarray, sr: int) -> np.ndarray:
@@ -556,13 +634,18 @@ def analyze_audio(
         raise NoBeatGrid(
             f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
 
-    fit = fit_beat_grid(det_beats, det_downbeats, duration, min_bpm, max_bpm)
+    bass_start = time.monotonic()
+    bass = band_pass(audio, sr)
+    onsets = onset_strength(bass, sr)
+    print(f"timing: bass {time.monotonic() - bass_start:.1f}s", file=sys.stderr)
+
+    fit = fit_beat_grid(det_beats, det_downbeats, duration, min_bpm, max_bpm, onsets)
     inferred = int((~fit.heard).sum())
     print(f"Grid: {fit.bpm:.1f} BPM, {len(fit.beat_times)} beats ({inferred} inferred), "
-          f"residual {fit.residual_ms:.1f} ms")
+          f"residual {fit.residual_ms:.1f} ms, {fit.kick_aligned} beats aligned to kicks "
+          f"({fit.kick_lag_ms:+.0f} ms lag, {fit.kick_residual_ms:.1f} ms after)")
 
     zones_start = time.monotonic()
-    bass = band_pass(audio, sr)
     low_band = compute_band_energy(bass, sr)
 
     if first_downbeat is not None:
@@ -582,13 +665,14 @@ def analyze_audio(
     kick_density, kick_bar_info = compute_kick_density(low_band, beats_data, duration)
 
     work_zones = detect_kick_zones(kick_density, kick_bar_info, duration=duration)
-    print(f"timing: bass+zones {time.monotonic() - zones_start:.1f}s", file=sys.stderr)
+    print(f"timing: zones {time.monotonic() - zones_start:.1f}s", file=sys.stderr)
 
     if grid_out is not None:
         grid_out.update(
             detectedBeatCount=len(det_beats), detectedDownbeatCount=len(det_downbeats),
             inferredBeatCount=inferred, residualMs=round(fit.residual_ms, 2), barPhase=fit.bar_phase,
-            tempoRangeBpm=list(tempo_range(fit)),
+            tempoRangeBpm=list(tempo_range(fit)), kickAlignedCount=fit.kick_aligned,
+            kickLagMs=fit.kick_lag_ms, kickResidualMs=fit.kick_residual_ms,
         )
 
     return {

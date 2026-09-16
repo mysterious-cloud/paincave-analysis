@@ -298,6 +298,88 @@ class GridFitTests(unittest.TestCase):
         self.assertEqual(len(analyze.compute_kick_density(np.array([]), beats)[0]), 0)
 
 
+class KickAlignmentTests(unittest.TestCase):
+    """The detector locks a few frames beside the kick in places; the grid is pulled back onto it."""
+
+    SR = 48000
+    PERIOD = 0.5  # 120 BPM
+
+    def audio(self, kicks: np.ndarray, seconds: float) -> np.ndarray:
+        """A decaying 55 Hz thump at each kick time over a quiet bass-band hiss."""
+        samples = int(seconds * self.SR)
+        audio = np.random.default_rng(0).standard_normal(samples) * 0.002  # a floor the 90th percentile sits in
+        length = int(0.25 * self.SR)
+        thump = np.sin(2 * np.pi * 55 * np.arange(length) / self.SR) * np.exp(-np.arange(length) / (0.05 * self.SR))
+        for t in kicks:
+            start = int(round(t * self.SR))
+            audio[start:start + length] += thump[:samples - start]
+        return audio
+
+    def onsets(self, kicks: np.ndarray, seconds: float) -> np.ndarray:
+        return analyze.onset_strength(analyze.band_pass(self.audio(kicks, seconds), self.SR), self.SR)
+
+    @staticmethod
+    def distance_to_kicks(times: np.ndarray, kicks: np.ndarray) -> np.ndarray:
+        return np.abs(times - kicks[analyze._nearest_index(kicks, times)])
+
+    def test_onset_strength_peaks_on_the_attack(self):
+        onsets = self.onsets(np.array([0.5]), 1.5)
+        self.assertEqual(len(onsets), 1500)  # one value per millisecond
+        self.assertLessEqual(abs(int(onsets.argmax()) - 500), 2)
+        self.assertTrue((onsets >= 0).all())
+
+    def test_detections_beside_the_kick_are_pulled_back_onto_it(self):
+        seconds = 80.0
+        kicks = np.arange(2.0, seconds - 2, self.PERIOD)
+        early = (kicks >= 30) & (kicks < 42)  # a section the detector hears 30 ms ahead of the kick
+        detections = np.round((kicks - 0.03 * early) / 0.02) * 0.02
+        onsets = self.onsets(kicks, seconds)
+        fit = analyze.fit_beat_grid(detections, detections[::4], seconds, onsets=onsets)
+        plain = analyze.fit_beat_grid(detections, detections[::4], seconds)
+
+        inside = (fit.beat_times >= 31) & (fit.beat_times < 41)
+        self.assertLess(self.distance_to_kicks(fit.beat_times[inside], kicks).max(), 0.003)
+        self.assertGreater(self.distance_to_kicks(plain.beat_times[inside], kicks).min(), 0.01)
+        self.assertGreater(fit.kick_aligned, 0.9 * len(kicks))
+        self.assertAlmostEqual(fit.kick_lag_ms, 0, delta=3)  # most beats were already on their kick
+        self.assertLess(fit.kick_residual_ms, 3)
+        # Far from that section the grid the detector gave is left where it was.
+        away = fit.beat_times[((fit.beat_times > 3) & (fit.beat_times < 10)) |
+                              ((fit.beat_times > 62) & (fit.beat_times < 75))]
+        self.assertLess(self.distance_to_kicks(away, plain.beat_times).max(), 0.005)
+        self.assertLess(self.distance_to_kicks(away, kicks).max(), 0.003)
+
+    def test_a_section_without_kicks_keeps_the_detector_grid(self):
+        seconds, quiet = 40.0, (16.0, 26.0)
+        kicks = np.arange(2.0, seconds - 2, self.PERIOD)
+        audio = self.audio(kicks[(kicks < quiet[0]) | (kicks >= quiet[1])], seconds)
+        audio[int(quiet[0] * self.SR):int(quiet[1] * self.SR)] = 0  # a breakdown with no bass under it
+        onsets = analyze.onset_strength(analyze.band_pass(audio, self.SR), self.SR)
+        detections = np.round(kicks / 0.02) * 0.02
+        times, aligned = analyze._kick_align(detections, detections, onsets)
+        # Clear of the two edges of the breakdown, where the cut itself reads as an onset.
+        silent = (detections >= quiet[0] + 0.5) & (detections < quiet[1] - 0.5)
+        self.assertFalse(aligned[silent].any())
+        self.assertGreater(aligned[~silent].mean(), 0.9)
+        self.assertTrue(np.array_equal(times[silent], detections[silent]))
+
+        fit = analyze.fit_beat_grid(detections, detections[::4], seconds, onsets=onsets)
+        plain = analyze.fit_beat_grid(detections, detections[::4], seconds)
+        quiet_beats = plain.beat_times[(plain.beat_times >= quiet[0]) & (plain.beat_times < quiet[1])]
+        self.assertLess(self.distance_to_kicks(quiet_beats, fit.beat_times).max(), 0.005)
+
+    def test_kick_alignment_is_deterministic(self):
+        seconds = 30.0
+        kicks = np.arange(2.0, seconds - 2, self.PERIOD)
+        detections = np.round(kicks / 0.02) * 0.02
+        onsets = self.onsets(kicks, seconds)
+        first, second = (analyze.fit_beat_grid(detections, detections[::4], seconds, onsets=onsets)
+                         for _ in range(2))
+        self.assertTrue(np.array_equal(first.beat_times, second.beat_times))
+        self.assertEqual((first.kick_aligned, first.kick_lag_ms, first.kick_residual_ms),
+                         (second.kick_aligned, second.kick_lag_ms, second.kick_residual_ms))
+
+
 class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
