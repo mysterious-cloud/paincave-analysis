@@ -52,10 +52,30 @@ With `--force`, omitted `--title`, `--artist` and `--genres` (and `--source-id` 
 
 Debug CLIs: `uv run python src/analyze.py <file> [-o out.json]` dumps the full analysis JSON, and `uv run python src/content_hash.py <file> [--full]` prints the hash.
 
+## Reference mode (Songlab)
+
+Songlab's reference-song analysis: one audio file in, one `analysis.json` out, with the song's tempo and bar grid. It has nothing to do with the Pain Cave library: no hash, staging, PCAV, AAC, work zones or `metadata.json`.
+
+```bash
+bin/analyze-reference song.wav -o analysis.json
+# same as:
+uv run python src/reference.py song.wav -o analysis.json
+```
+
+| Flag | Default | |
+|------|---------|--|
+| `audio_file` | required | Input audio (wav, flac, m4a, mp3, ...) |
+| `-o, --output` | required | Where to write `analysis.json` |
+| `--min-bpm` / `--max-bpm` | `60` / `200` | Tempo range the fitted grid must fall in (the Pain Cave import keeps `100` / `180`) |
+| `--first-downbeat` | detected | Bar 1 time, snapped to a grid beat |
+
+It runs the import path's Beat This! detection and `fit_beat_grid`, so the grid has the same strengths and limits (slow drift is followed, a tempo step is not; see [Beat grid](docs/output-formats.md#beat-grid)). The bars are numbered from the first downbeat, with pickups as bar 0, and meter is assumed 4/4. Refused input exits 1 with `Error: refused <file>: <reason>; nothing written` and writes no file. Fields, units and bar numbering: [docs/reference-format.md](docs/reference-format.md).
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm
 - [docs/pcav-format.md](docs/pcav-format.md): `analysis.pcav` binary spec
+- [docs/reference-format.md](docs/reference-format.md): `analysis.json` of reference mode (Songlab)
 - Architecture and plans live in the main repo: [../paincave/docs/architecture.md](../paincave/docs/architecture.md), [../paincave/docs/plan.md](../paincave/docs/plan.md)
 
 ## Verification

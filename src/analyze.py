@@ -427,6 +427,17 @@ def first_bar_time(fit: GridFit) -> float:
     return float(fit.beat_times[on_phase[0] if len(on_phase) else 0])
 
 
+def choose_first_bar(fit: GridFit, first_downbeat: float | None, duration: float) -> float:
+    """Bar 1: the voted downbeat, or the grid beat nearest a user-given time."""
+    if first_downbeat is None:
+        return first_bar_time(fit)
+    if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration:
+        raise ValueError("First downbeat must identify a beat within the audio")
+    first_downbeat_t = float(fit.beat_times[np.argmin(np.abs(fit.beat_times - first_downbeat))])
+    print(f"Using user-specified first downbeat: {first_downbeat_t:.3f}s")
+    return first_downbeat_t
+
+
 def band_pass(audio: np.ndarray, sr: int, low: int = 20, high: int = 150) -> np.ndarray:
     """Zero-phase 4th-order Butterworth band-pass; the default 20-150 Hz band holds kick and bass."""
     nyquist = sr / 2
@@ -579,6 +590,12 @@ def compute_beat_confidence(beat_times: np.ndarray, expected_bpm: float) -> np.n
     return np.array(confidences)
 
 
+def grid_confidences(fit: GridFit) -> np.ndarray:
+    """Per grid beat: interval consistency, capped at 0.5 where no detection landed (a guess the app can tell apart)."""
+    confidences = compute_beat_confidence(fit.beat_times, fit.bpm)
+    return np.where(fit.heard, confidences, np.minimum(confidences, 0.5))
+
+
 def build_beats_array(
         beat_times: np.ndarray,
         first_downbeat_t: float,
@@ -601,6 +618,24 @@ def build_beats_array(
     return beats
 
 
+def detect_beats(audio: np.ndarray, sr: int, min_bpm: int, max_bpm: int) -> tuple[np.ndarray, np.ndarray]:
+    """Beat and downbeat detections inside the audio, refused when too few remain for a grid."""
+    duration = len(audio) / sr
+    beats_start = time.monotonic()
+    det_beats, det_downbeats = extract_beats(audio, sr)
+    print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
+
+    if np.any(det_beats < 0) or np.any(det_beats > duration + DETECTOR_FRAME_SECONDS):
+        raise NoBeatGrid("Detected beats lie outside audio duration")
+    # A track whose last frame lands on its final beat reports it at the duration; the grid holds beats
+    # strictly inside the audio, so that beat is dropped rather than refused.
+    det_beats, det_downbeats = det_beats[det_beats < duration], det_downbeats[det_downbeats < duration]
+    if len(det_beats) < MIN_BEATS:
+        raise NoBeatGrid(
+            f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
+    return det_beats, det_downbeats
+
+
 def analyze_audio(
         audio_path: Path,
         min_bpm: int = 100,
@@ -621,18 +656,7 @@ def analyze_audio(
     duration = len(audio) / sr
     require_sound(audio, sr)
 
-    beats_start = time.monotonic()
-    det_beats, det_downbeats = extract_beats(audio, sr)
-    print(f"timing: beats {time.monotonic() - beats_start:.1f}s", file=sys.stderr)
-
-    if np.any(det_beats < 0) or np.any(det_beats > duration + DETECTOR_FRAME_SECONDS):
-        raise NoBeatGrid("Detected beats lie outside audio duration")
-    # A track whose last frame lands on its final beat reports it at the duration; the grid holds beats
-    # strictly inside the audio, so that beat is dropped rather than refused.
-    det_beats, det_downbeats = det_beats[det_beats < duration], det_downbeats[det_downbeats < duration]
-    if len(det_beats) < MIN_BEATS:
-        raise NoBeatGrid(
-            f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
+    det_beats, det_downbeats = detect_beats(audio, sr, min_bpm, max_bpm)
 
     bass_start = time.monotonic()
     bass = band_pass(audio, sr)
@@ -648,19 +672,9 @@ def analyze_audio(
     zones_start = time.monotonic()
     low_band = compute_band_energy(bass, sr)
 
-    if first_downbeat is not None:
-        if not np.isfinite(first_downbeat) or not 0 <= first_downbeat < duration:
-            raise ValueError("First downbeat must identify a beat within the audio")
-        first_downbeat_t = float(fit.beat_times[np.argmin(np.abs(fit.beat_times - first_downbeat))])
-        print(f"Using user-specified first downbeat: {first_downbeat_t:.3f}s")
-    else:
-        first_downbeat_t = first_bar_time(fit)
+    first_downbeat_t = choose_first_bar(fit, first_downbeat, duration)
 
-    # A grid beat with no detection under it is a guess the app should be able to tell apart.
-    confidences = compute_beat_confidence(fit.beat_times, fit.bpm)
-    confidences = np.where(fit.heard, confidences, np.minimum(confidences, 0.5))
-
-    beats_data = build_beats_array(fit.beat_times, first_downbeat_t, confidences)
+    beats_data = build_beats_array(fit.beat_times, first_downbeat_t, grid_confidences(fit))
 
     kick_density, kick_bar_info = compute_kick_density(low_band, beats_data, duration)
 

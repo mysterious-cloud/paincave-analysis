@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pain Cave Analysis — reference-song analysis CLI wrapper (Songlab)
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" python "$PROJECT_DIR/src/reference.py" "$@"
