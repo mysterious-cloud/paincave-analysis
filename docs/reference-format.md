@@ -4,7 +4,7 @@ What `src/reference.py` (via `bin/analyze-reference`) writes for [Songlab](../..
 
 ```bash
 bin/analyze-reference song.wav -o analysis.json [--min-bpm 60] [--max-bpm 200] [--first-downbeat SECONDS] \
-    [--stages grid,stems,sections,peaks] [--cache-dir DIR] [--peaks PATH] [--progress] [--print-activity]
+    [--stages grid,stems,sections,allin1,peaks] [--cache-dir DIR] [--peaks PATH] [--progress] [--print-activity]
 ```
 
 Decode, Beat This! detection and the same grid fit as the import path (see [Beat grid](output-formats.md#beat-grid): `analyze.fit_beat_grid`, kick alignment included), with tempo bounds that default to 60-200 BPM instead of 100-180. No library, hash, staging, PCAV, AAC, work zones, `metadata.json` or manifest. Later layers (stems, sections, chords) add fields to this file and hang on `grid.bars`.
@@ -80,6 +80,7 @@ All times are seconds from the start of the decoded audio, rounded to millisecon
 
 - **`stems`**: Demucs `htdemucs` (MIT) splits the song into drums, bass, other and vocals on the 44.1 kHz stereo decode (MPS when available, else CPU; about 20 s and 90 s for a 4-minute song). The stems are cached as 16-bit FLAC in `--cache-dir` (default `cache/` beside `-o`), in a folder named by the input's SHA-256 and the model, so a re-run with other flags skips the split. Demucs is in the `reference` dependency group; `bin/analyze-reference` runs with it, Pain Cave's import never installs it.
 - **`sections`**: boundaries and repetition labels from the audio alone (`src/sections.py`, numpy and scipy only). Bar-synchronous chroma (harmony), MFCC (timbre) and, with the stems stage, stem levels each give a bar-by-bar self-similarity matrix; a checkerboard kernel (4 and 8 bars) along their mean scores the change at each bar start. Peaks become boundaries, weighted toward 4-bar phrases (the phrase phase is whichever bar position carries the most change), at least 2 bars apart; a trailing fade below -40 dBFS joins the last section. Segments that match bar for bar share a letter. Letters are repetition groups, not names.
+- **`allin1`** (brings `stems` with it): [All-In-One](https://github.com/mir-aidj/all-in-one) (allin1 1.1.0, MIT; code and checkpoint), the `harmonix-all` 8-fold ensemble, run by `bin/allin1` in its own environment (`tools/allin1`: torch 2.4, numpy < 2, madmom from git), so Pain Cave's lock never changes. It reads the cached htdemucs stems instead of splitting again. NATTEN, which its attention layers call, is replaced by `tools/allin1/natten_torch.py`: plain PyTorch, verified against NATTEN 0.15.1 to 2e-6, and it runs on Apple's GPU. The ensemble takes about 10 s per song on an M1 Max (NATTEN on CPU: about 5 minutes); the stage takes about 35 s with spectrograms and loading. Its result is cached beside the stems. Its segments snap to the nearest bar start; its silent `start` joins the first section and `end` the last. Its labels are names (intro, verse, chorus, bridge, inst, solo, outro), not repetition letters.
 - **`peaks`**: waveform peaks for drawing, written to `--peaks` (default `peaks.json` beside `-o`) before `analysis.json`, compact JSON: `{ "peaksPerSecond": 50, "mix": [[min, max], ...], "stems": { "drums": [[min, max], ...], ... } }`, three decimals. `stems` is `{}` without the stems stage.
 
 Any stage beyond `grid` also adds `loudness` to every bar.
@@ -93,7 +94,7 @@ Any stage beyond `grid` also adds `loudness` to every bar.
 | `stems.peakDb` | object | Stem name to its loudest bar in dBFS RMS. A bar's absolute level is `peakDb + 20·log10(level)` |
 | `stems.relDb`, `stems.floorDb` | number | The suggested activity rule: a stem plays in a bar when it is within `relDb` (24) dB of its own loudest bar and above `floorDb` (-50) dBFS. Readers may apply their own |
 | `grid.bars[].novelty` | number | With `sections`: how much the song changes at this bar's start, 0-1 (bar 1 is 0) |
-| `sections.methods` | object | Method name to its result; `ssm` from this stage, others (SongFormer, All-In-One) may be added by separate tools |
+| `sections.methods` | object | Method name to its result: `ssm` (sections stage), `allin1` (allin1 stage, also with `model`, `bpm` and its raw `segmentsSeconds`) |
 | `sections.methods.<m>.tool`, `.version` | string, integer | Which method and its revision |
 | `sections.methods.<m>.sections[]` | array | `{startBar, endBar, label, confidence}`: contiguous, covering bar 1 to the last bar; `endBar` is exclusive (the next section's `startBar`); `label` is a letter A-Z by first appearance; `confidence` is the boundary's phrase-weighted novelty (1 for the first) |
 | `sections.methods.<m>.boundariesSeconds` | number[] | The start time of every section after the first |

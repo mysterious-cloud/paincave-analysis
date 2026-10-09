@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# All-In-One sections for Songlab, in its own environment (tools/allin1), on Apple's GPU when there is one
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR/tools/allin1" python -I "$PROJECT_DIR/tools/allin1/run.py" "$@"

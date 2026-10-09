@@ -8,6 +8,7 @@ chords) hangs on. Contract: docs/reference-format.md.
 
 `--stages` adds layers on top of the grid. `stems` splits the song with Demucs (cached under `--cache-dir`)
 and measures each stem's level per bar; `sections` finds boundaries and repetition labels (`sections.py`);
+`allin1` adds All-In-One's named sections (`allin1_stage.py`, its own environment, on the cached stems);
 `peaks` writes the waveform peaks the Lab draws beside the analysis.
 
 None of the Pain Cave library machinery runs here: no content hash, staging, PCAV, AAC, work zones or
@@ -20,6 +21,7 @@ import os
 import sys
 from pathlib import Path
 
+import allin1_stage
 import analyze
 import features
 import sections
@@ -30,7 +32,7 @@ DEFAULT_MIN_BPM = 60  # reference songs run slower than the Pain Cave default of
 DEFAULT_MAX_BPM = 200
 METER = (4, 4)  # assumed, not detected: the grid, like the detector's bars, counts four beats to a bar
 TIME_DECIMALS = 3  # milliseconds, as `analyze.build_beats_array` rounds beat times
-STAGES = ("grid", "stems", "sections", "peaks")  # grid always runs; the others are opt-in
+STAGES = ("grid", "stems", "sections", "allin1", "peaks")  # grid always runs; the others are opt-in
 
 
 def report(stage: str, fraction: float, enabled: bool) -> None:
@@ -124,7 +126,7 @@ def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Pa
     for bar, loudness in zip(bars, features.bar_loudness(mono, stem_split.RATE, bars)):
         bar["loudness"] = loudness
 
-    separated, levels = None, None
+    separated, levels, files = None, None, {}
     if "stems" in stages:
         report("stems", 0, progress)
         files = stem_split.stems_for(audio_path, mix, cache_dir, lambda f: report("stems", f, progress))
@@ -147,6 +149,13 @@ def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Pa
             bar["novelty"] = value
         document["sections"] = {"methods": {sections.METHOD: block}}
         report("sections", 1, progress)
+
+    if "allin1" in stages:
+        report("allin1", 0, progress)
+        stems_dir = Path(next(iter(files.values()))).parent
+        found = allin1_stage.block(allin1_stage.run(audio_path, stems_dir, cache_dir), bars)
+        document.setdefault("sections", {"methods": {}})["methods"][allin1_stage.METHOD] = found
+        report("allin1", 1, progress)
 
     if "peaks" not in stages:
         return None
@@ -175,7 +184,8 @@ def parse_stages(value: str) -> set[str]:
     unknown = stages - set(STAGES)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown stage {', '.join(sorted(unknown))}; choose from {', '.join(STAGES)}")
-    return stages | {"grid"}
+    # allin1 reads the Demucs stems
+    return stages | {"grid"} | ({"stems"} if "allin1" in stages else set())
 
 
 def main(argv: list[str] | None = None) -> None:
