@@ -54,7 +54,7 @@ Debug CLIs: `uv run python src/analyze.py <file> [-o out.json]` dumps the full a
 
 ## Reference mode (Songlab)
 
-Songlab's reference-song analysis: one audio file in, one `analysis.json` out, with the song's tempo and bar grid. It has nothing to do with the Pain Cave library: no hash, staging, PCAV, AAC, work zones or `metadata.json`.
+Songlab's reference-song analysis: one audio file in, one `analysis.json` out, with the song's tempo and bar grid, and on request (`--stages stems,peaks`) which Demucs stems play in each bar plus waveform peaks. It has nothing to do with the Pain Cave library: no hash, staging, PCAV, AAC, work zones or `metadata.json`.
 
 ```bash
 bin/analyze-reference song.wav -o analysis.json

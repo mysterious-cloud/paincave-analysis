@@ -3,7 +3,8 @@
 What `src/reference.py` (via `bin/analyze-reference`) writes for [Songlab](../../songlab): one `analysis.json` describing a reference song's bar grid. Verified against the source; if they disagree, the source wins. Unrelated to the Pain Cave track directory in [output-formats.md](output-formats.md), which this mode never touches.
 
 ```bash
-bin/analyze-reference song.wav -o analysis.json [--min-bpm 60] [--max-bpm 200] [--first-downbeat SECONDS]
+bin/analyze-reference song.wav -o analysis.json [--min-bpm 60] [--max-bpm 200] [--first-downbeat SECONDS] \
+    [--stages grid,stems,peaks] [--cache-dir DIR] [--peaks PATH] [--progress] [--print-activity]
 ```
 
 Decode, Beat This! detection and the same grid fit as the import path (see [Beat grid](output-formats.md#beat-grid): `analyze.fit_beat_grid`, kick alignment included), with tempo bounds that default to 60-200 BPM instead of 100-180. No library, hash, staging, PCAV, AAC, work zones, `metadata.json` or manifest. Later layers (stems, sections, chords) add fields to this file and hang on `grid.bars`.
@@ -73,6 +74,28 @@ All times are seconds from the start of the decoded audio, rounded to millisecon
 - **The last bar's `end` is not a downbeat** when no later beat exists inside the audio: it is the bar's fourth beat plus one beat interval, capped at `source.durationSeconds`. The last bar can be shorter than the others when the audio ends inside it.
 - Tempo may drift (the grid follows slow drift), so bar lengths differ slightly; use `start` and `end`, not `bar * 4 * 60 / bpm`.
 
+## Layers (`--stages`)
+
+`grid` always runs and is everything above. The other stages are opt-in and only add fields, so a reader of the grid-only file reads these too.
+
+- **`stems`**: Demucs `htdemucs` (MIT) splits the song into drums, bass, other and vocals on the 44.1 kHz stereo decode (MPS when available, else CPU; about 20 s and 90 s for a 4-minute song). The stems are cached as 16-bit FLAC in `--cache-dir` (default `cache/` beside `-o`), in a folder named by the input's SHA-256 and the model, so a re-run with other flags skips the split. Demucs is in the `reference` dependency group; `bin/analyze-reference` runs with it, Pain Cave's import never installs it.
+- **`peaks`**: waveform peaks for drawing, written to `--peaks` (default `peaks.json` beside `-o`) before `analysis.json`, compact JSON: `{ "peaksPerSecond": 50, "mix": [[min, max], ...], "stems": { "drums": [[min, max], ...], ... } }`, three decimals. `stems` is `{}` without the stems stage.
+
+Any stage beyond `grid` also adds `loudness` to every bar.
+
+| Field | Type | |
+|-------|------|--|
+| `grid.bars[].loudness` | number | Mix level over the bar, dBFS RMS, one decimal; `-120` for silence |
+| `grid.bars[].stems` | object | `{drums, bass, other, vocals}`: each stem's RMS over the bar relative to that stem's loudest bar, linear 0-1, three decimals |
+| `stems.model` | string | `"htdemucs"` |
+| `stems.files` | object | Stem name to its FLAC, relative to the cache directory |
+| `stems.peakDb` | object | Stem name to its loudest bar in dBFS RMS. A bar's absolute level is `peakDb + 20·log10(level)` |
+| `stems.relDb`, `stems.floorDb` | number | The suggested activity rule: a stem plays in a bar when it is within `relDb` (24) dB of its own loudest bar and above `floorDb` (-50) dBFS. Readers may apply their own |
+
+`--progress` prints `PROGRESS {"stage": "grid", "fraction": 0.0}` lines on stdout, one JSON object per line, for each stage from 0 to 1; everything else on stdout is free text. `--print-activity` prints one row per bar with the playing stems and the loudness, for checking by ear.
+
+The stems are measured, not heard: bleed between stems is common (htdemucs puts pads and guitars in `other`), so `other` reads as playing almost everywhere in a dense mix.
+
 ## Refusals
 
 Same idea as the import path: the CLI exits 1, prints one line to stderr and writes nothing, not even a partial `-o` file. An `-o` file from an earlier run is left as it was. The file is otherwise written whole (temporary file, then rename), creating `-o`'s parent directory only once the analysis has succeeded.
@@ -87,4 +110,4 @@ Other failures are `Error: <file>: <reason>; nothing written`, also exit 1: a fi
 
 ## Determinism
 
-The same input file and flags give identical bytes: no timestamps, no randomness (the detector runs on a fixed thread count, as in the import path). `config` records the flags so a consumer can key a cache on file plus config. The detector checkpoint is pinned in `src/models.py`; changing it changes grids, and will bump `version` or add a field naming it.
+The same input file and flags give identical bytes: no timestamps, no randomness (the detector runs on a fixed thread count, as in the import path; Demucs runs without random shifts). Stem levels come from the cached FLAC, so they repeat exactly once the cache exists; a fresh split on another device (MPS vs CPU) can differ in the last digits. `config` records the flags so a consumer can key a cache on file plus config. The detector checkpoint is pinned in `src/models.py`; changing it changes grids, and will bump `version` or add a field naming it.

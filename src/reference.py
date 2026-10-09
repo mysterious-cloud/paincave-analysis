@@ -6,6 +6,9 @@ Decodes one audio file, fits the Beat This! bar grid with `analyze.fit_beat_grid
 `analysis.json`: tempo, numbered beats with confidence, and the bars every later layer (stems, sections,
 chords) hangs on. Contract: docs/reference-format.md.
 
+`--stages` adds layers on top of the grid. `stems` splits the song with Demucs (cached under `--cache-dir`)
+and measures each stem's level per bar; `peaks` writes the waveform peaks the Lab draws beside the analysis.
+
 None of the Pain Cave library machinery runs here: no content hash, staging, PCAV, AAC, work zones or
 metadata. A refused input exits 1 with one stderr line and writes nothing.
 """
@@ -17,6 +20,7 @@ import sys
 from pathlib import Path
 
 import analyze
+import features
 
 FORMAT_VERSION = 1
 FORMAT_KIND = "songlab-reference-analysis"
@@ -24,6 +28,13 @@ DEFAULT_MIN_BPM = 60  # reference songs run slower than the Pain Cave default of
 DEFAULT_MAX_BPM = 200
 METER = (4, 4)  # assumed, not detected: the grid, like the detector's bars, counts four beats to a bar
 TIME_DECIMALS = 3  # milliseconds, as `analyze.build_beats_array` rounds beat times
+STAGES = ("grid", "stems", "peaks")  # grid always runs; the others are opt-in
+
+
+def report(stage: str, fraction: float, enabled: bool) -> None:
+    """One machine-readable progress line on stdout, for Songlab's job runner."""
+    if enabled:
+        print("PROGRESS " + json.dumps({"stage": stage, "fraction": round(fraction, 3)}), flush=True)
 
 
 def build_bars(beats: list[dict], duration: float) -> list[dict]:
@@ -53,10 +64,12 @@ def analyze_reference(
         min_bpm: int = DEFAULT_MIN_BPM,
         max_bpm: int = DEFAULT_MAX_BPM,
         first_downbeat: float | None = None,
+        progress: bool = False,
 ) -> dict:
     """Decode `audio_path` and return the analysis document. Raises `analyze.NoBeatGrid` on a refused input."""
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
+    report("grid", 0, progress)
     audio, sr = analyze.load_audio(audio_path)
     duration = len(audio) / sr
     analyze.require_sound(audio, sr)
@@ -77,6 +90,7 @@ def analyze_reference(
     bars = build_bars(beats, duration_seconds)
     if not bars:
         raise analyze.NoBeatGrid("no beat grid: no complete bar follows the first downbeat")
+    report("grid", 1, progress)
 
     return {
         "version": FORMAT_VERSION,
@@ -95,15 +109,63 @@ def analyze_reference(
     }
 
 
-def write_json(path: Path, document: dict) -> None:
+def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Path, progress: bool) -> dict | None:
+    """Measure the opt-in layers onto `document` (in place) and return the peaks document, if asked for.
+
+    Everything is measured in seconds on the 44.1 kHz stereo decode, then read out per grid bar.
+    """
+    import stems as stem_split
+
+    bars = document["grid"]["bars"]
+    mix = stem_split.load_stereo(audio_path)
+    mono = mix.mean(axis=0)
+    for bar, loudness in zip(bars, features.bar_loudness(mono, stem_split.RATE, bars)):
+        bar["loudness"] = loudness
+
+    separated = None
+    if "stems" in stages:
+        report("stems", 0, progress)
+        files = stem_split.stems_for(audio_path, mix, cache_dir, lambda f: report("stems", f, progress))
+        separated = stem_split.load_stems(files)
+        levels, peak_db = features.stem_levels(separated, stem_split.RATE, bars)
+        for i, bar in enumerate(bars):
+            bar["stems"] = {name: levels[name][i] for name in stem_split.STEMS}
+        document["stems"] = {
+            "model": stem_split.MODEL,
+            "files": {name: os.path.relpath(path, cache_dir) for name, path in files.items()},
+            "peakDb": peak_db,
+            "relDb": features.REL_DB,
+            "floorDb": features.FLOOR_DB,
+        }
+
+    if "peaks" not in stages:
+        return None
+    report("peaks", 0, progress)
+    result = {"peaksPerSecond": features.PEAKS_PER_SECOND,
+              "mix": features.peaks(mono, stem_split.RATE),
+              "stems": {name: features.peaks(samples, stem_split.RATE) for name, samples in (separated or {}).items()}}
+    report("peaks", 1, progress)
+    return result
+
+
+def write_json(path: Path, document: dict, indent: int | None = 2) -> None:
     """Write the document whole or not at all; a failure leaves any earlier file at `path` as it was."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     try:
-        temporary.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n")
+        separators = None if indent else (",", ":")
+        temporary.write_text(json.dumps(document, indent=indent, separators=separators, allow_nan=False) + "\n")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def parse_stages(value: str) -> set[str]:
+    stages = {s.strip() for s in value.split(",") if s.strip()}
+    unknown = stages - set(STAGES)
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown stage {', '.join(sorted(unknown))}; choose from {', '.join(STAGES)}")
+    return stages | {"grid"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -116,6 +178,16 @@ def main(argv: list[str] | None = None) -> None:
                         help=f"Maximum BPM for the fitted beat grid (default: {DEFAULT_MAX_BPM})")
     parser.add_argument("--first-downbeat", type=float,
                         help="Time in seconds for bar 1 (snapped to the nearest grid beat; overrides detection)")
+    parser.add_argument("--stages", type=parse_stages, default={"grid"},
+                        help=f"Comma-separated layers to measure: {', '.join(STAGES)} (default: grid)")
+    parser.add_argument("--cache-dir", type=Path,
+                        help="Where stems are cached between runs (default: a 'cache' folder beside the output)")
+    parser.add_argument("--peaks", type=Path,
+                        help="Where the peaks stage writes its file (default: peaks.json beside the output)")
+    parser.add_argument("--progress", action="store_true",
+                        help='Print PROGRESS {"stage", "fraction"} lines on stdout')
+    parser.add_argument("--print-activity", action="store_true",
+                        help="Print which stems play in each bar (needs the stems stage)")
     args = parser.parse_args(argv)
 
     if not 0 < args.min_bpm < args.max_bpm:
@@ -125,14 +197,23 @@ def main(argv: list[str] | None = None) -> None:
     if args.output.resolve() == args.audio_file.resolve():
         raise SystemExit(f"Error: refused {args.audio_file.name}: output path is the input file; nothing written")
 
+    cache_dir = args.cache_dir or args.output.parent / "cache"
+    peaks_path = args.peaks or args.output.with_name("peaks.json")
     try:
-        document = analyze_reference(args.audio_file, args.min_bpm, args.max_bpm, args.first_downbeat)
+        document = analyze_reference(args.audio_file, args.min_bpm, args.max_bpm, args.first_downbeat, args.progress)
+        peaks = add_layers(document, args.audio_file, args.stages, cache_dir, args.progress) \
+            if args.stages - {"grid"} else None
     except analyze.NoBeatGrid as e:
         raise SystemExit(f"Error: refused {args.audio_file.name}: {e}; nothing written")
     except (ValueError, RuntimeError, OSError) as e:  # an undecodable file or a bad flag value
         raise SystemExit(f"Error: {args.audio_file.name}: {' '.join(str(e).split())}; nothing written")
 
+    if peaks is not None:
+        write_json(peaks_path, peaks, indent=None)  # before the analysis: its presence means the run finished
     write_json(args.output, document)
+    if args.print_activity and "stems" in document:
+        levels = {name: [bar["stems"][name] for bar in document["grid"]["bars"]] for name in document["stems"]["peakDb"]}
+        print(features.activity_matrix(document["grid"]["bars"], levels, document["stems"]["peakDb"]))
     bars = document["grid"]["bars"]
     print(f"Wrote {args.output}: {document['tempo']['bpm']} BPM, {len(bars)} bars")
 

@@ -19,3 +19,8 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.0.2",
 ]
+# Songlab reference analysis only (bin/analyze-reference); Pain Cave's import never installs or loads it.
+reference = [
+    "demucs==4.0.1",
+    "certifi",
+]

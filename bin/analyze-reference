@@ -3,4 +3,4 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec uv run --project "$PROJECT_DIR" python "$PROJECT_DIR/src/reference.py" "$@"
+exec uv run --project "$PROJECT_DIR" --group reference python "$PROJECT_DIR/src/reference.py" "$@"
