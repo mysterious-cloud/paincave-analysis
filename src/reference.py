@@ -7,7 +7,8 @@ Decodes one audio file, fits the Beat This! bar grid with `analyze.fit_beat_grid
 chords) hangs on. Contract: docs/reference-format.md.
 
 `--stages` adds layers on top of the grid. `stems` splits the song with Demucs (cached under `--cache-dir`)
-and measures each stem's level per bar; `peaks` writes the waveform peaks the Lab draws beside the analysis.
+and measures each stem's level per bar; `sections` finds boundaries and repetition labels (`sections.py`);
+`peaks` writes the waveform peaks the Lab draws beside the analysis.
 
 None of the Pain Cave library machinery runs here: no content hash, staging, PCAV, AAC, work zones or
 metadata. A refused input exits 1 with one stderr line and writes nothing.
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import analyze
 import features
+import sections
 
 FORMAT_VERSION = 1
 FORMAT_KIND = "songlab-reference-analysis"
@@ -28,7 +30,7 @@ DEFAULT_MIN_BPM = 60  # reference songs run slower than the Pain Cave default of
 DEFAULT_MAX_BPM = 200
 METER = (4, 4)  # assumed, not detected: the grid, like the detector's bars, counts four beats to a bar
 TIME_DECIMALS = 3  # milliseconds, as `analyze.build_beats_array` rounds beat times
-STAGES = ("grid", "stems", "peaks")  # grid always runs; the others are opt-in
+STAGES = ("grid", "stems", "sections", "peaks")  # grid always runs; the others are opt-in
 
 
 def report(stage: str, fraction: float, enabled: bool) -> None:
@@ -122,7 +124,7 @@ def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Pa
     for bar, loudness in zip(bars, features.bar_loudness(mono, stem_split.RATE, bars)):
         bar["loudness"] = loudness
 
-    separated = None
+    separated, levels = None, None
     if "stems" in stages:
         report("stems", 0, progress)
         files = stem_split.stems_for(audio_path, mix, cache_dir, lambda f: report("stems", f, progress))
@@ -137,6 +139,14 @@ def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Pa
             "relDb": features.REL_DB,
             "floorDb": features.FLOOR_DB,
         }
+
+    if "sections" in stages:
+        report("sections", 0, progress)
+        block, novelty = sections.analyze_sections(mono, stem_split.RATE, document["grid"]["beats"], bars, levels)
+        for bar, value in zip(bars, novelty):
+            bar["novelty"] = value
+        document["sections"] = {"methods": {sections.METHOD: block}}
+        report("sections", 1, progress)
 
     if "peaks" not in stages:
         return None

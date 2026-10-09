@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Score analysis.json section methods against confirmed sections (Songlab Lab truth export)
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" --group reference python "$PROJECT_DIR/src/score_sections.py" "$@"

@@ -4,7 +4,7 @@ What `src/reference.py` (via `bin/analyze-reference`) writes for [Songlab](../..
 
 ```bash
 bin/analyze-reference song.wav -o analysis.json [--min-bpm 60] [--max-bpm 200] [--first-downbeat SECONDS] \
-    [--stages grid,stems,peaks] [--cache-dir DIR] [--peaks PATH] [--progress] [--print-activity]
+    [--stages grid,stems,sections,peaks] [--cache-dir DIR] [--peaks PATH] [--progress] [--print-activity]
 ```
 
 Decode, Beat This! detection and the same grid fit as the import path (see [Beat grid](output-formats.md#beat-grid): `analyze.fit_beat_grid`, kick alignment included), with tempo bounds that default to 60-200 BPM instead of 100-180. No library, hash, staging, PCAV, AAC, work zones, `metadata.json` or manifest. Later layers (stems, sections, chords) add fields to this file and hang on `grid.bars`.
@@ -79,6 +79,7 @@ All times are seconds from the start of the decoded audio, rounded to millisecon
 `grid` always runs and is everything above. The other stages are opt-in and only add fields, so a reader of the grid-only file reads these too.
 
 - **`stems`**: Demucs `htdemucs` (MIT) splits the song into drums, bass, other and vocals on the 44.1 kHz stereo decode (MPS when available, else CPU; about 20 s and 90 s for a 4-minute song). The stems are cached as 16-bit FLAC in `--cache-dir` (default `cache/` beside `-o`), in a folder named by the input's SHA-256 and the model, so a re-run with other flags skips the split. Demucs is in the `reference` dependency group; `bin/analyze-reference` runs with it, Pain Cave's import never installs it.
+- **`sections`**: boundaries and repetition labels from the audio alone (`src/sections.py`, numpy and scipy only). Bar-synchronous chroma (harmony), MFCC (timbre) and, with the stems stage, stem levels each give a bar-by-bar self-similarity matrix; a checkerboard kernel (4 and 8 bars) along their mean scores the change at each bar start. Peaks become boundaries, weighted toward 4-bar phrases (the phrase phase is whichever bar position carries the most change), at least 2 bars apart; a trailing fade below -40 dBFS joins the last section. Segments that match bar for bar share a letter. Letters are repetition groups, not names.
 - **`peaks`**: waveform peaks for drawing, written to `--peaks` (default `peaks.json` beside `-o`) before `analysis.json`, compact JSON: `{ "peaksPerSecond": 50, "mix": [[min, max], ...], "stems": { "drums": [[min, max], ...], ... } }`, three decimals. `stems` is `{}` without the stems stage.
 
 Any stage beyond `grid` also adds `loudness` to every bar.
@@ -91,10 +92,17 @@ Any stage beyond `grid` also adds `loudness` to every bar.
 | `stems.files` | object | Stem name to its FLAC, relative to the cache directory |
 | `stems.peakDb` | object | Stem name to its loudest bar in dBFS RMS. A bar's absolute level is `peakDb + 20·log10(level)` |
 | `stems.relDb`, `stems.floorDb` | number | The suggested activity rule: a stem plays in a bar when it is within `relDb` (24) dB of its own loudest bar and above `floorDb` (-50) dBFS. Readers may apply their own |
+| `grid.bars[].novelty` | number | With `sections`: how much the song changes at this bar's start, 0-1 (bar 1 is 0) |
+| `sections.methods` | object | Method name to its result; `ssm` from this stage, others (SongFormer, All-In-One) may be added by separate tools |
+| `sections.methods.<m>.tool`, `.version` | string, integer | Which method and its revision |
+| `sections.methods.<m>.sections[]` | array | `{startBar, endBar, label, confidence}`: contiguous, covering bar 1 to the last bar; `endBar` is exclusive (the next section's `startBar`); `label` is a letter A-Z by first appearance; `confidence` is the boundary's phrase-weighted novelty (1 for the first) |
+| `sections.methods.<m>.boundariesSeconds` | number[] | The start time of every section after the first |
 
 `--progress` prints `PROGRESS {"stage": "grid", "fraction": 0.0}` lines on stdout, one JSON object per line, for each stage from 0 to 1; everything else on stdout is free text. `--print-activity` prints one row per bar with the playing stems and the loudness, for checking by ear.
 
 The stems are measured, not heard: bleed between stems is common (htdemucs puts pads and guitars in `other`), so `other` reads as playing almost everywhere in a dense mix.
+
+`bin/score-sections analysis.json truth.json` scores every method against confirmed sections (`{"sections": [{startBar, endBar, label}]}`, exported from Songlab's Lab): boundary F exactly and within one bar, and pairwise label F over bars.
 
 ## Refusals
 
