@@ -23,4 +23,5 @@ dev = [
 reference = [
     "demucs==4.0.1",
     "certifi",
+    "torchcrepe==0.0.24",
 ]

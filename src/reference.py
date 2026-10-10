@@ -9,6 +9,7 @@ chords) hangs on. Contract: docs/reference-format.md.
 `--stages` adds layers on top of the grid. `stems` splits the song with Demucs (cached under `--cache-dir`)
 and measures each stem's level per bar; `sections` finds boundaries and repetition labels (`sections.py`);
 `allin1` adds All-In-One's named sections (`allin1_stage.py`, its own environment, on the cached stems);
+`melody` transcribes the vocal stem's sung notes onto the beats (`melody.py`, CREPE, on the cached stems);
 `peaks` writes the waveform peaks the Lab draws beside the analysis.
 
 None of the Pain Cave library machinery runs here: no content hash, staging, PCAV, AAC, work zones or
@@ -24,6 +25,7 @@ from pathlib import Path
 import allin1_stage
 import analyze
 import features
+import melody
 import sections
 
 FORMAT_VERSION = 1
@@ -32,7 +34,7 @@ DEFAULT_MIN_BPM = 60  # reference songs run slower than the Pain Cave default of
 DEFAULT_MAX_BPM = 200
 METER = (4, 4)  # assumed, not detected: the grid, like the detector's bars, counts four beats to a bar
 TIME_DECIMALS = 3  # milliseconds, as `analyze.build_beats_array` rounds beat times
-STAGES = ("grid", "stems", "sections", "allin1", "peaks")  # grid always runs; the others are opt-in
+STAGES = ("grid", "stems", "sections", "allin1", "melody", "peaks")  # grid always runs; the others are opt-in
 
 
 def report(stage: str, fraction: float, enabled: bool) -> None:
@@ -157,6 +159,14 @@ def add_layers(document: dict, audio_path: Path, stages: set[str], cache_dir: Pa
         document.setdefault("sections", {"methods": {}})["methods"][allin1_stage.METHOD] = found
         report("allin1", 1, progress)
 
+    if "melody" in stages:
+        report("melody", 0, progress)
+        cache = cache_dir / f"melody-{Path(files['vocals']).parent.name}-crepe-{melody.MODEL}.npz"
+        document["melody"] = melody.melody(separated["vocals"], stem_split.RATE, document["grid"]["beats"],
+                                           document["grid"]["firstDownbeatIndex"], cache,
+                                           lambda f: report("melody", f, progress))
+        report("melody", 1, progress)
+
     if "peaks" not in stages:
         return None
     report("peaks", 0, progress)
@@ -184,8 +194,8 @@ def parse_stages(value: str) -> set[str]:
     unknown = stages - set(STAGES)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown stage {', '.join(sorted(unknown))}; choose from {', '.join(STAGES)}")
-    # allin1 reads the Demucs stems
-    return stages | {"grid"} | ({"stems"} if "allin1" in stages else set())
+    # allin1 and melody read the Demucs stems
+    return stages | {"grid"} | ({"stems"} if stages & {"allin1", "melody"} else set())
 
 
 def main(argv: list[str] | None = None) -> None:
