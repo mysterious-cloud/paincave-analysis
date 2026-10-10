@@ -86,6 +86,15 @@ class StageTests(unittest.TestCase):
                 b = melody.melody(vocals, 44100, [{"time": 0.5 * i} for i in range(4)], 0, cache)
         self.assertEqual([(n["start"], n["pitch"]) for n in b["notes"]], [(0.0, 64), (1.0, 67)])
 
+    def test_faint_notes_are_left_out(self):
+        pitch, periodicity, _ = track((50, 64, 0), (50, 67, 0))
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "melody.npz"
+            np.savez(cache, pitch=pitch, periodicity=periodicity)
+            vocals = np.concatenate([np.full(441 * 50, 0.3), np.full(441 * 50, 0.01)]).astype(np.float32)  # -30 dB
+            b = melody.melody(vocals, 44100, [{"time": 0.5 * i} for i in range(4)], 0, cache)
+        self.assertEqual([n["pitch"] for n in b["notes"]], [64])
+
 
 if __name__ == "__main__":
     unittest.main()

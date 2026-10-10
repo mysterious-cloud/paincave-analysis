@@ -34,7 +34,7 @@ REATTACK_FRAMES = 3  # ...within this many frames starts a new note on the same 
 MIN_NOTE = 7  # frames: shorter notes are dropped
 MERGE_GAP = 5  # frames: the same pitch either side of a gap this short is one note
 PAD = 5  # frames tracked either side of a sung stretch
-FAINT_DB = -20.0  # notes quieter than this below the stem's loudest frame are likely bleed or backing: readers weigh them less
+FAINT_DB = -20.0  # notes quieter than this below the stem's loudest frame are likely bleed or backing: left out
 
 Progress = Callable[[float], None]
 
@@ -182,4 +182,5 @@ def melody(vocals: np.ndarray, rate: int, beats: list[dict], first_downbeat: int
            progress: Progress = lambda f: None) -> dict:
     """The `melody` block for the vocal stem (mono, at `rate`)"""
     pitch, periodicity = track(vocals, rate, cache, progress)
-    return block(notes(pitch, periodicity, frame_levels(vocals, rate)), beats, first_downbeat)
+    sung = [n for n in notes(pitch, periodicity, frame_levels(vocals, rate)) if n[4] >= FAINT_DB]
+    return block(sung, beats, first_downbeat)
