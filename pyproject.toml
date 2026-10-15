@@ -19,3 +19,7 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.0.2",
 ]
+# Workout downloader only (bin/download-workout): research input that never enters the library.
+workout = [
+    "playwright==1.64.0",
+]

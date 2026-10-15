@@ -7,3 +7,6 @@ __pycache__/
 *.wav
 .claude/
 .pytest_cache/
+
+# Workout downloader: HAR exports hold session data and playback links
+*.har
