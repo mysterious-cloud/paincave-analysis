@@ -32,7 +32,7 @@ uv run python src/import_track.py track.wav --title "Dark Descent" --genres "dar
 | `--library` | `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks` | Track library directory |
 | `-t, --title` | source filename stem | |
 | `-a, --artist` | `Pain Cave` | |
-| `--source` | `SUNO` | Only choice: `SUNO` |
+| `--source` | `SUNO` | `SUNO`, or `CLASS` for a song paincave Studio cut from a recorded class |
 | `--source-id` | SUNO id from the file's comment tag | |
 | `-g, --genres` | none | Comma-separated genre slugs |
 | `--min-bpm` / `--max-bpm` | `100` / `180` | Tempo range the fitted grid must fall in |

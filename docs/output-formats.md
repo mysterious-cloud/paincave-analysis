@@ -94,7 +94,7 @@ Validated against `../paincave/shared/schemas/metadata.schema.json` (`additional
 | `hash` | string `^[a-f0-9]{12}$` | Content hash (= directory name) |
 | `title` | string, min 1 | `--title`, else the active track's title (candidates), else source filename stem |
 | `artist` | string | `--artist`, else the active track's artist (candidates), else `"Pain Cave"` |
-| `source` | `"SUNO"` | `--source` (only allowed value) |
+| `source` | `"SUNO"` \| `"CLASS"` | `--source` (default `SUNO`; `CLASS`: a song paincave Studio cut from a recorded class) |
 | `sourceId` | string | `--source-id`, else SUNO `id=` from the source's ffprobe `comment` tag, else the active track's `sourceId` (candidates), else `""` |
 | `genres` | string[] | `--genres` split on commas, else the active track's genres (candidates), else `[]` |
 | `bpm` | number | `60 /` the median interval of the fitted grid, 1 decimal |

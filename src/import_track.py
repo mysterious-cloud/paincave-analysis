@@ -556,8 +556,8 @@ def main():
                         help="Track library directory (default: $PAINCAVE_TRACKS_DIR)")
     parser.add_argument("-t", "--title", type=str, help="Track title (default: filename)")
     parser.add_argument("-a", "--artist", type=str, help="Artist name (default: Pain Cave)")
-    parser.add_argument("--source", type=str, default="SUNO", choices=["SUNO"],
-                        help="Audio source platform")
+    parser.add_argument("--source", type=str, default="SUNO", choices=["SUNO", "CLASS"],
+                        help="Audio source: SUNO, or CLASS for a song cut from a recorded class (paincave Studio)")
     parser.add_argument("--source-id", type=str, help="ID from source platform")
     parser.add_argument("-g", "--genres", type=str, help="Comma-separated genre slugs")
     parser.add_argument("--min-bpm", type=int, default=100, help="Minimum BPM (default: 100)")
