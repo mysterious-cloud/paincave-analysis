@@ -6,8 +6,8 @@ Runs in its own environment (this folder's pyproject). NATTEN, which allin1's at
 natten_torch.py (same results to float precision, verified against NATTEN 0.15.1 on CPU), so the model runs on
 Apple's GPU: the 8-fold ensemble takes about 10 s per song on an M1 Max instead of about 5 minutes on CPU.
 
-The stems come from reference.py's Demucs cache (htdemucs, FLAC): allin1's own split would run Demucs again, with
-a random time shift. Usage:
+The stems come from reference.py's Demucs cache (htdemucs_ft, FLAC): allin1's own split would run Demucs again,
+with plain htdemucs and a random time shift. Usage:
     run.py AUDIO --stems DIR -o OUT.json [--device auto|mps|cpu] [--model harmonix-all]
 """
 
@@ -67,7 +67,8 @@ def main(argv: list[str] | None = None) -> None:
     started = time.time()
     with tempfile.TemporaryDirectory(prefix="allin1-") as tmp:
         work = Path(tmp)
-        # allin1 skips its own split when demix/htdemucs/<audio stem>/<name>.wav exist
+        # allin1 skips its own split when demix/htdemucs/<audio stem>/<name>.wav exist: the folder name is where it
+        # looks, the stems in it are ours (htdemucs_ft)
         stem_dir = work / "demix" / "htdemucs" / "audio"
         stem_dir.mkdir(parents=True)
         for name in STEMS:

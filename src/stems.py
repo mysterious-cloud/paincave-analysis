@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Four-stem split for Songlab reference analysis: Demucs `htdemucs` (MIT) into drums, bass, other, vocals.
+Four-stem split for Songlab reference analysis: Demucs `htdemucs_ft` into drums, bass, other, vocals. The
+fine-tuned bag of four models, one per stem: cleaner stems for about four times the time, and the only model
+Pain Cave uses (owner 2026-10-16: "default on using demucs_ft ALWAYS ... for everything").
 
 Only `reference.py` imports this, and Demucs itself is imported inside `separate`, so the Pain Cave import
 path never loads it. Demucs lives in the optional `reference` dependency group (`uv run --group reference`).
@@ -18,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-MODEL = "htdemucs"
+MODEL = "htdemucs_ft"
 STEMS = ("drums", "bass", "other", "vocals")
 RATE = 44100  # Demucs models are trained at 44.1 kHz stereo
 OVERLAP = 0.25

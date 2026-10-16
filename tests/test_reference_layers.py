@@ -58,7 +58,7 @@ class LayerTests(unittest.TestCase):
         doc = json.loads(self.out.read_text())
         self.assertEqual(list(doc)[-1], "stems")
         block = doc["stems"]
-        self.assertEqual(block["model"], "htdemucs")
+        self.assertEqual(block["model"], "htdemucs_ft")
         self.assertEqual(sorted(block["files"]), ["bass", "drums", "other", "vocals"])
         self.assertTrue(all(not Path(f).is_absolute() for f in block["files"].values()))
         self.assertEqual((block["relDb"], block["floorDb"]), (features.REL_DB, features.FLOOR_DB))
