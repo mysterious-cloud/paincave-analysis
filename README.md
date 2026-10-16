@@ -29,7 +29,7 @@ uv run python src/import_track.py track.wav --title "Dark Descent" --genres "dar
 | Flag | Default | |
 |------|---------|--|
 | `audio_file` | required | Input audio |
-| `--library` | `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks` | Track library directory |
+| `--library` | `$PAINCAVE_TRACKS_DIR`, else `../paincave-tracks/library` | Track library directory |
 | `-t, --title` | source filename stem | |
 | `-a, --artist` | `Pain Cave` | |
 | `--source` | `SUNO` | `SUNO`, or `CLASS` for a song paincave Studio cut from a recorded class |
@@ -73,7 +73,7 @@ It runs the import path's Beat This! detection and `fit_beat_grid`, so the grid 
 
 ## Workout download (research)
 
-Downloads the original audio and the site's captions of a LES MILLS On Demand workout you can play, as research input for Studio's class breakdown. Research content stays on the laptop: it never goes into `../paincave-tracks`, a commit or an export. Needs Google Chrome and FFmpeg (with ffprobe).
+Downloads the original audio and the site's captions of a LES MILLS On Demand workout you can play, as research input for Studio's class breakdown. Research content stays on the laptop: it lands in the research workspace's inbox, `../paincave-tracks/research/inbox/` (git-ignored, never exported), where Studio lists it at `paincave-studio.localhost/research`; never in the main library, a commit or an export. Needs Google Chrome and FFmpeg (with ffprobe).
 
 ```bash
 bin/download-workout 'https://my.lesmillsondemand.com/workout/THE%20TRIP%20%2343%2040%20min'
@@ -86,7 +86,7 @@ A dedicated Chrome window opens on its own profile (`~/.paincave-analysis/workou
 | Flag | Default | |
 |------|---------|--|
 | `url` | required | `https://my.lesmillsondemand.com/workout/...`, quoted |
-| `-o, --output` | `~/paincave-research/workouts` | Parent of the workout folders; an existing folder is never overwritten |
+| `-o, --output` | `../paincave-tracks/research/inbox` | Parent of the workout folders; an existing folder is never overwritten |
 | `--language` | `en` | Caption language; exits 1 if the workout has none in it (captions are never generated) |
 | `--profile` | `~/.paincave-analysis/workout-chrome` | Dedicated Chrome profile; never your everyday one |
 | `--timeout` | `300` | Seconds for sign-in and finding the playlist |

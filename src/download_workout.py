@@ -269,9 +269,11 @@ def download(url, master_url, master, output, language):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('url', help='LES MILLS workout URL (quote it in your shell)')
-    # Defaults stay outside the repo: the profile holds session cookies and the audio is research-only.
-    parser.add_argument('-o', '--output', type=Path, default=Path('~/paincave-research/workouts'),
-                        help='Parent folder for workout folders (default: ~/paincave-research/workouts)')
+    # Defaults stay outside this repo: the profile holds session cookies, and the research-only audio goes to the
+    # research workspace's inbox (git-ignored, never exported), where Studio lists it
+    research_inbox = Path(__file__).resolve().parent.parent.parent / 'paincave-tracks' / 'research' / 'inbox'
+    parser.add_argument('-o', '--output', type=Path, default=research_inbox,
+                        help='Parent folder for workout folders (default: ../paincave-tracks/research/inbox)')
     parser.add_argument('--language', default='en', help='Caption language code (default: en)')
     parser.add_argument('--profile', type=Path, default=Path('~/.paincave-analysis/workout-chrome'),
                         help='Dedicated persistent Chrome profile (default: ~/.paincave-analysis/workout-chrome); '

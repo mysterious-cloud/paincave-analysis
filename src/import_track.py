@@ -46,7 +46,7 @@ from pcav import (
 
 DEFAULT_TRACKS_DIR = Path(os.environ.get(
     "PAINCAVE_TRACKS_DIR",
-    Path(__file__).resolve().parent.parent.parent / "paincave-tracks"
+    Path(__file__).resolve().parent.parent.parent / "paincave-tracks" / "library"
 ))
 
 SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "paincave" / "shared" / "schemas"
