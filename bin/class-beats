@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pain Cave Analysis — every beat and downbeat of a long recording, for Studio's cut editor (no grid, no tempo bounds)
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" python "$PROJECT_DIR/src/class_beats.py" "$@"

@@ -96,6 +96,16 @@ Each workout folder (`THE_TRIP_43_40_min/`) holds `<name>.m4a` (the original aud
 
 It supports the unprotected HLS (Mux) delivery seen so far: DRM-protected or live streams are refused, and site changes may need updates. Keep the profile and any HAR private; both hold session data.
 
+## Class beats (Studio's cut editor)
+
+Every beat and downbeat of a long recording, for Studio's cut editor (paincave `docs/studio.md`, phase 2b): the Beat This! detector as the import runs it (`small0`), over the whole recording, with no grid fit and no tempo bounds, so a class's songs and their tempo changes all come through. The cut editor fits its own grid per song.
+
+```bash
+bin/class-beats THE_TRIP_43.m4a -o class.beats.json   # about 30 s for a 45-minute class on an M1 Max
+```
+
+ffmpeg decodes straight to the detector's 22.05 kHz mono, so a long class stays small in memory. Output: `{ "checkpoint": { "name", "sha256" }, "beats": [...], "downbeats": [...] }`, seconds to the millisecond, written whole or not at all; exit 1 with the reason for anything ffmpeg can't decode.
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm
