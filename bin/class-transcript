@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pain Cave Analysis — subtitles for a class without them (Demucs htdemucs_ft vocals, then whisper.cpp large-v3), for Studio
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" --group reference python "$PROJECT_DIR/src/class_transcript.py" "$@"

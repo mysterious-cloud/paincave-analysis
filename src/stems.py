@@ -110,6 +110,53 @@ def separate(mix: np.ndarray, report: Progress = lambda _fraction: None) -> dict
     return {name: out[model.sources.index(name)].numpy().astype(np.float32) for name in STEMS}
 
 
+VOCALS_CHUNK = 300  # seconds separated at a time: a 45-minute class would need ~4 GB for all four stems at once
+VOCALS_CONTEXT = 10  # seconds either side of a chunk, heard but dropped, so its edges sound like its middle
+
+
+def separate_vocals(mix: np.ndarray, report: Progress = lambda _fraction: None) -> np.ndarray:
+    """
+    The vocals of a (2, samples) mix at 44.1 kHz, mono float32, for a recording of any length. `htdemucs_ft` weighs
+    each stem by one of its four models alone (one-hot weights), so its vocals model run by itself gives the bag's
+    vocals for a quarter of the time. Separated in chunks, each with context either side.
+    """
+    import torch
+    from demucs import apply
+    from demucs.pretrained import get_model
+
+    _with_certificates()
+    bag = get_model(MODEL)
+    index = bag.sources.index("vocals")
+    weights = np.array(bag.weights)
+    if sorted(weights[:, index]) != [0] * (len(bag.models) - 1) + [1]:
+        raise RuntimeError(f"{MODEL} doesn't take its vocals from one model alone: {bag.weights}")
+    model = bag.models[int(weights[:, index].argmax())]
+    model.eval()
+    wav = torch.from_numpy(mix)
+    reference = wav.mean(0)
+    mean, std = reference.mean(), reference.std()
+    if std == 0:
+        raise ValueError("audio is digital silence")
+    del reference
+    wav = (wav - mean) / std
+    length, chunk, context = wav.shape[1], VOCALS_CHUNK * RATE, VOCALS_CONTEXT * RATE
+    starts = range(0, length, chunk)
+    vocals = np.zeros(length, dtype=np.float32)
+    original_tqdm = apply.tqdm.tqdm
+    try:
+        for done, start in enumerate(starts):
+            apply.tqdm.tqdm = _ProgressBar(lambda fraction: report((done + fraction) / len(starts)))
+            heard_from, end = max(0, start - context), min(length, start + chunk)
+            with torch.no_grad():
+                out = apply.apply_model(model, wav[None, :, heard_from:min(length, end + context)], device=_device(),
+                                        shifts=0, split=True, overlap=OVERLAP, progress=True)[0]
+            voice = (out[model.sources.index("vocals")] * std + mean).mean(0).numpy()
+            vocals[start:end] = voice[start - heard_from:end - heard_from]
+    finally:
+        apply.tqdm.tqdm = original_tqdm
+    return vocals
+
+
 def write_stems(stems: dict[str, np.ndarray], folder: Path) -> dict[str, Path]:
     """Write each stem as 16-bit FLAC; each file appears whole or not at all."""
     folder.mkdir(parents=True, exist_ok=True)

@@ -106,6 +106,20 @@ bin/class-beats THE_TRIP_43.m4a -o class.beats.json   # about 30 s for a 45-minu
 
 ffmpeg decodes straight to the detector's 22.05 kHz mono, so a long class stays small in memory. Output: `{ "checkpoint": { "name", "sha256" }, "beats": [...], "downbeats": [...] }`, seconds to the millisecond, written whole or not at all; exit 1 with the reason for anything ffmpeg can't decode.
 
+## Class transcript (subtitles for a class without them)
+
+For Studio's *Make subtitles* (paincave `docs/studio.md`, phase 2b): the coach's voice split out with Demucs `htdemucs_ft` (its vocals model alone, which is the bag's vocals: one-hot weights; in 5-minute chunks, so a 45-minute class never holds four stems in memory at once: about 3 GB in all, not 7), transcribed by whisper.cpp `large-v3` with every token timed by DTW, then cut into caption-sized lines (`lines_of`: at sentence ends, pauses over 0.8 s, a comma past 8 words, at most 14 words or 6 s).
+
+```bash
+bin/class-transcript THE_TRIP_43.m4a -o THE_TRIP_43.whisper.vtt   # 5 min for THE TRIP 43's 44 on an M1 Max (Demucs 2, whisper 3); 6½ for a 45½-minute class
+```
+
+Setup, once: `brew install whisper-cpp` and `ggml-large-v3.bin` in `~/.local/share/whisper/` (or pass `--model`), from Hugging Face `ggerganov/whisper.cpp`. Needs the `reference` group (Demucs).
+
+whisper.cpp's flags were measured on THE TRIP 43 and a 45-minute Apple Fitness class: `-mc 0` (no text carried between 30-second windows: with it, "Attack. The intensity is all." looped over the Apple class's last 30 minutes); no voice activity detection (it leaves token times on its speech-only timeline); `-dtw large.v3` with `-nfa` (whisper's own token times put a segment's first word at the silence before it, "Hey" at 0:00 for 0:16.8; DTW needs flash attention off).
+
+Progress goes to stdout as `PROGRESS {"stage": "voice" | "words", "fraction"}` lines; the VTT starts with a `NOTE` saying how it was made and is written whole or not at all; exit 1 with the reason (no model, not audio, whisper failed). Against THE TRIP 43's real subtitles: 99% of the coach's 591 lines heard, 92% of their words, lines as long as theirs (median 1.7 s, 4 words); 38 of 548 lines aren't in them (lyrics, and calls the subtitles leave out). Singing lands in the vocals stem, so songs with more of it bring more lyrics through.
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm
