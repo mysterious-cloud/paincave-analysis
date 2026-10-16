@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pain Cave Analysis — workout audio and caption downloader (research input for Studio's class breakdown)
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" --group workout python "$PROJECT_DIR/src/download_workout.py" "$@"

@@ -71,6 +71,31 @@ uv run python src/reference.py song.wav -o analysis.json
 
 It runs the import path's Beat This! detection and `fit_beat_grid`, so the grid has the same strengths and limits (slow drift is followed, a tempo step is not; see [Beat grid](docs/output-formats.md#beat-grid)). The bars are numbered from the first downbeat, with pickups as bar 0, and meter is assumed 4/4. Refused input exits 1 with `Error: refused <file>: <reason>; nothing written` and writes no file. Fields, units and bar numbering: [docs/reference-format.md](docs/reference-format.md).
 
+## Workout download (research)
+
+Downloads the original audio and the site's captions of a LES MILLS On Demand workout you can play, as research input for Studio's class breakdown. Research content stays on the laptop: it never goes into `../paincave-tracks`, a commit or an export. Needs Google Chrome and FFmpeg (with ffprobe).
+
+```bash
+bin/download-workout 'https://my.lesmillsondemand.com/workout/THE%20TRIP%20%2343%2040%20min'
+# same as:
+uv run --group workout python src/download_workout.py 'URL'
+```
+
+A dedicated Chrome window opens on its own profile (`~/.paincave-analysis/workout-chrome`). Sign in there on the first run; the login is kept for later runs. Click Play if playback doesn't start. The window closes once the HLS master playlist has been captured, and the download continues in the terminal until it prints `Done`. Don't run two copies on the same profile at once.
+
+| Flag | Default | |
+|------|---------|--|
+| `url` | required | `https://my.lesmillsondemand.com/workout/...`, quoted |
+| `-o, --output` | `~/paincave-research/workouts` | Parent of the workout folders; an existing folder is never overwritten |
+| `--language` | `en` | Caption language; exits 1 if the workout has none in it (captions are never generated) |
+| `--profile` | `~/.paincave-analysis/workout-chrome` | Dedicated Chrome profile; never your everyday one |
+| `--timeout` | `300` | Seconds for sign-in and finding the playlist |
+| `--har` | | Read the playlist from a Chrome HAR export (DevTools → Network, with response bodies, only this workout) instead of opening Chrome |
+
+Each workout folder (`THE_TRIP_43_40_min/`) holds `<name>.m4a` (the original audio stream, not re-encoded), `<name>.en.vtt` / `.srt` / `.txt` (merged captions, original timestamps), `subtitle-segments/` (source WebVTT) and `metadata.json` (source URL, retrieval time, ffprobe output, caption counts; no playback tokens). The audio must match the playlist duration within 2 s and decode without errors. All of it is written to a temporary folder and moved into place only when complete.
+
+It supports the unprotected HLS (Mux) delivery seen so far: DRM-protected or live streams are refused, and site changes may need updates. Keep the profile and any HAR private; both hold session data.
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm
