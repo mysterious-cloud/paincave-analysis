@@ -177,6 +177,7 @@ class ImportPathUntouchedTests(unittest.TestCase):
         for function in (analyze.analyze_audio, import_track.import_song):
             parameters = inspect.signature(function).parameters
             self.assertEqual((parameters["min_bpm"].default, parameters["max_bpm"].default), (100, 180))
+            self.assertIsNone(parameters["bpm"].default)  # the grid is fitted unless a manual BPM is given
         with patch.object(sys, "argv", ["import_track.py", "--help"]), redirect_stdout(io.StringIO()) as help_text, \
                 self.assertRaises(SystemExit):
             import_track.main()

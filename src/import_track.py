@@ -318,9 +318,10 @@ def import_song(
         source_file: Path | None = None,
         processing_record: Path | None = None,
         first_downbeat: float | None = None,
+        bpm: float | None = None,
 ) -> str:
     """Atomically import a new track, retain a new analysis revision with --force, or replace the active
-    analysis with --replace.
+    analysis with --replace. `bpm` with `first_downbeat` sets a constant grid by hand instead of fitting one.
 
     Existing active artifacts and authored data are never replaced. Revisions are
     candidates for review, not automatic changes to the grid used by saved plans.
@@ -332,6 +333,8 @@ def import_song(
     library_dir = library_dir.resolve()
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
+    if bpm is not None and first_downbeat is None:
+        raise ValueError("A manual BPM requires the first downbeat")
     with timed_stage("decode"):
         samples, sample_rate, input_sha256 = decode_input(audio_path)
     require_sound(samples, sample_rate)  # refused before identity checks and staging
@@ -433,7 +436,7 @@ def import_song(
                 samples, sample_rate = load_audio(original_wav)
             grid_metrics: dict = {}
             analysis = analyze_audio(original_wav, min_bpm, max_bpm, first_downbeat=first_downbeat,
-                                     audio=(samples, sample_rate), grid_out=grid_metrics)
+                                     audio=(samples, sample_rate), grid_out=grid_metrics, bpm=bpm)
             validate_json(analysis, "analysis")
             info = sf.info(original_wav)
             if analysis["duration"] != info.frames / info.samplerate or analysis["sampleRate"] != sample_rate:
@@ -506,12 +509,13 @@ def import_song(
                                "duration": info.frames / info.samplerate},
                     "processing": processing, "playback": playback,
                     "loudness": loudness,
-                    "grid": {"firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
+                    "grid": {"source": "fitted" if bpm is None else "manual",
+                             "firstDownbeatIndex": first_idx, "beatsPerBar": 4, "reviewed": False,
                              "beatCount": len(beat_times), "firstBeat": beat_times[0], "lastBeat": beat_times[-1],
                              "confidenceKind": "grid-heard",
                              "meanConfidence": sum(b["confidence"] for b in analysis["beats"]) / len(beat_times),
                              **grid_metrics},
-                    "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat,
+                    "config": {"minBpm": min_bpm, "maxBpm": max_bpm, "firstDownbeat": first_downbeat, "bpm": bpm,
                                "beatCheckpoint": models.checkpoint_info(), "beatThreads": DETECTOR_THREADS,
                                "peakFilterHz": 300, "peakWindows": [256, 8192], "aacBitrate": "256k",
                                "loudnessFilter": "ebur128=peak=true"},
@@ -570,6 +574,8 @@ def main():
     parser.add_argument("--source-file", type=Path, help="Retain the unprocessed source download")
     parser.add_argument("--processing-record", type=Path, help="Audio preparation provenance JSON")
     parser.add_argument("--first-downbeat", type=float, help="Override bar 1 start (snapped to nearest grid beat)")
+    parser.add_argument("--bpm", type=float,
+                        help="With --first-downbeat: a constant grid at this BPM from that beat, instead of the fitted one")
     parser.add_argument("--check-model", action="store_true",
                         help="Print the beat detector checkpoint (downloading it if needed) and exit")
     args = parser.parse_args()
@@ -582,6 +588,8 @@ def main():
 
     if args.audio_file is None:
         parser.error("the following arguments are required: audio_file")
+    if args.bpm is not None and args.first_downbeat is None:
+        parser.error("--bpm requires --first-downbeat")
     if not args.audio_file.exists():
         print(f"Error: File not found: {args.audio_file}", file=sys.stderr)
         sys.exit(1)
@@ -612,6 +620,7 @@ def main():
             source_file=args.source_file,
             processing_record=args.processing_record,
             first_downbeat=args.first_downbeat,
+            bpm=args.bpm,
         )
     except NoBeatGrid as e:
         raise SystemExit(f"Error: refused {args.audio_file.name}: {e}; nothing written")

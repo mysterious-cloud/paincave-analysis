@@ -377,6 +377,34 @@ def fit_beat_grid(
                    aligned_count, round(kick_lag_ms, 2), round(kick_residual_ms, 2))
 
 
+def constant_grid(bpm: float, first_downbeat: float, duration: float, det_beats) -> GridFit:
+    """A constant grid from a hand-set tempo and bar 1, with no fit and no tempo bounds.
+
+    The owner's BPM stands even where the fit would refuse it (a steady song whose local fit wobbles past
+    a bound). Index 0 is the first downbeat; the grid walks back from it to the start of the audio and on
+    to the end. Detections only mark which beats were heard, for the confidences.
+    """
+    if not math.isfinite(bpm) or bpm <= 0:
+        raise NoBeatGrid(f"no beat grid: manual tempo {bpm} BPM is not a positive number")
+    if not math.isfinite(first_downbeat) or not 0 <= first_downbeat < duration:
+        raise NoBeatGrid(f"no beat grid: first downbeat {first_downbeat} s lies outside the {duration:.3f} s audio")
+    period = 60 / bpm
+    index = np.arange(-math.floor(first_downbeat / period) - 1, math.ceil((duration - first_downbeat) / period) + 1)
+    grid = first_downbeat + index * period
+    inside = (grid >= 0) & (grid < duration)
+    index, grid = index[inside], grid[inside]
+    if len(grid) < MIN_BEATS:
+        raise NoBeatGrid(f"no beat grid: {len(grid)} beats fit in {duration:.1f} s at {bpm:.1f} BPM")
+
+    beats = np.sort(np.asarray(det_beats, dtype=float))
+    heard, residual_ms = np.zeros(len(grid), bool), 0.0
+    if len(beats):
+        offset, heard = _match_detections(grid, beats, max(0.07, 0.2 * period))
+        if heard.any():
+            residual_ms = float(np.sqrt(np.mean(offset[heard] ** 2)) * 1000)
+    return GridFit(period, first_downbeat, grid, index, heard, 0, residual_ms)
+
+
 def _require_rideable(grid: np.ndarray, period: float, duration: float, bounds: tuple[float, float] | None) -> None:
     """Refuse a grid that is too short, runs backwards, or (once final) holds an interval out of bounds."""
     if len(grid) < MIN_BEATS:
@@ -618,8 +646,12 @@ def build_beats_array(
     return beats
 
 
-def detect_beats(audio: np.ndarray, sr: int, min_bpm: int, max_bpm: int) -> tuple[np.ndarray, np.ndarray]:
-    """Beat and downbeat detections inside the audio, refused when too few remain for a grid."""
+def detect_beats(audio: np.ndarray, sr: int, min_bpm: int, max_bpm: int,
+                 min_beats: int = MIN_BEATS) -> tuple[np.ndarray, np.ndarray]:
+    """Beat and downbeat detections inside the audio, refused when fewer than `min_beats` remain.
+
+    A manual grid passes 0: it needs no detections, and uses whatever there are for the confidences.
+    """
     duration = len(audio) / sr
     beats_start = time.monotonic()
     det_beats, det_downbeats = extract_beats(audio, sr)
@@ -630,9 +662,9 @@ def detect_beats(audio: np.ndarray, sr: int, min_bpm: int, max_bpm: int) -> tupl
     # A track whose last frame lands on its final beat reports it at the duration; the grid holds beats
     # strictly inside the audio, so that beat is dropped rather than refused.
     det_beats, det_downbeats = det_beats[det_beats < duration], det_downbeats[det_downbeats < duration]
-    if len(det_beats) < MIN_BEATS:
+    if len(det_beats) < min_beats:
         raise NoBeatGrid(
-            f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {MIN_BEATS} required")
+            f"no beat grid: {len(det_beats)} beats detected between {min_bpm} and {max_bpm} BPM; at least {min_beats} required")
     return det_beats, det_downbeats
 
 
@@ -643,29 +675,37 @@ def analyze_audio(
         first_downbeat: float | None = None,
         audio: tuple[np.ndarray, int] | None = None,
         grid_out: dict | None = None,
+        bpm: float | None = None,
 ) -> dict:
     """Main analysis pipeline. `audio` is the file's already decoded (samples, rate), if any.
 
-    `grid_out`, when given, collects grid-fit diagnostics for the manifest; the returned analysis
-    itself carries only the fields the shared schema allows.
+    `bpm`, with `first_downbeat`, sets a constant grid by hand in place of the fitted one: no tempo bounds,
+    and any number of detections (even none). `grid_out`, when given, collects grid-fit diagnostics for
+    the manifest; the returned analysis itself carries only the fields the shared schema allows.
     """
 
     if not 0 < min_bpm < max_bpm:
         raise ValueError("BPM bounds must satisfy 0 < min_bpm < max_bpm")
+    if bpm is not None and first_downbeat is None:
+        raise ValueError("A manual BPM requires the first downbeat")
     audio, sr = audio if audio is not None else load_audio(audio_path)
     duration = len(audio) / sr
     require_sound(audio, sr)
 
-    det_beats, det_downbeats = detect_beats(audio, sr, min_bpm, max_bpm)
+    det_beats, det_downbeats = detect_beats(audio, sr, min_bpm, max_bpm, MIN_BEATS if bpm is None else 0)
 
     bass_start = time.monotonic()
     bass = band_pass(audio, sr)
-    onsets = onset_strength(bass, sr)
+    onsets = onset_strength(bass, sr) if bpm is None else None  # only the fit aligns to kicks
     print(f"timing: bass {time.monotonic() - bass_start:.1f}s", file=sys.stderr)
 
-    fit = fit_beat_grid(det_beats, det_downbeats, duration, min_bpm, max_bpm, onsets)
+    if bpm is None:
+        fit = fit_beat_grid(det_beats, det_downbeats, duration, min_bpm, max_bpm, onsets)
+    else:
+        fit = constant_grid(bpm, first_downbeat, duration, det_beats)
     inferred = int((~fit.heard).sum())
-    print(f"Grid: {fit.bpm:.1f} BPM, {len(fit.beat_times)} beats ({inferred} inferred), "
+    print(f"Grid{'' if bpm is None else ' (manual)'}: {fit.bpm:.1f} BPM, "
+          f"{len(fit.beat_times)} beats ({inferred} inferred), "
           f"residual {fit.residual_ms:.1f} ms, {fit.kick_aligned} beats aligned to kicks "
           f"({fit.kick_lag_ms:+.0f} ms lag, {fit.kick_residual_ms:.1f} ms after)")
 

@@ -1,6 +1,6 @@
 """Deterministic pipeline tests: real decoding/encoding, stubbed expensive inference."""
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -278,6 +278,29 @@ class GridFitTests(unittest.TestCase):
                          (second.period, second.phase, second.bar_phase, second.residual_ms, second.bpm))
         self.assertTrue(np.array_equal(first.beat_times, second.beat_times))
         self.assertTrue(np.array_equal(first.heard, second.heard))
+
+    def test_manual_grid_is_constant_from_the_first_downbeat(self):
+        period = 60 / 184
+        fit = analyze.constant_grid(184, 1.1, 30.0, self.detections(150, start=1.1, period=period, quantize=None))
+        self.assertLess(np.abs(np.diff(fit.beat_times) - period).max(), 1e-9)
+        self.assertEqual(fit.beat_times[fit.index == 0].tolist(), [1.1])  # exactly on a beat
+        self.assertEqual((fit.phase, fit.bar_phase, fit.residual_ms), (1.1, 0, 0.0))
+        self.assertTrue(0 <= fit.beat_times[0] < period)          # walked back to the start of the audio
+        self.assertTrue(30 - period <= fit.beat_times[-1] < 30)   # and on to its end
+        self.assertEqual(fit.heard.tolist(), (fit.beat_times >= 1.1).tolist())
+        first = analyze.choose_first_bar(fit, 1.1, 30.0)
+        self.assertEqual(first, 1.1)
+        numbered = analyze.build_beats_array(fit.beat_times, first)
+        self.assertEqual([b['bar'] for b in numbered[:3]], [0, 0, 0])
+        self.assertEqual(numbered[3], {'t': 1.1, 'bar': 1, 'beat': 1, 'confidence': 1.0})
+
+    def test_manual_grid_refuses_only_what_cannot_be_a_grid(self):
+        for args, message in (((0, 1.0, 30.0), 'manual tempo'), ((float('nan'), 1.0, 30.0), 'manual tempo'),
+                              ((184, 30.0, 30.0), 'first downbeat'), ((184, -0.1, 30.0), 'first downbeat'),
+                              ((60, 1.0, 5.0), '5 beats fit')):
+            with self.subTest(args=args), self.assertRaisesRegex(analyze.NoBeatGrid, message):
+                analyze.constant_grid(*args, [])
+        self.assertAlmostEqual(analyze.constant_grid(240, 0.0, 30.0, []).bpm, 240)  # no tempo bounds
 
     @unittest.skipUnless(analyze.models.checkpoint_path().is_file(), "checkpoint not cached")
     def test_detector_smoke(self):
@@ -678,6 +701,53 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(json.loads((folder / 'analysis.json').read_text())['firstDownbeat'], 1.25)
         self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 2)
         self.assertEqual(json.loads((folder / 'manifest.json').read_text())['config']['firstDownbeat'], 1.3)
+
+    def test_manual_grid_replaces_the_fit_even_where_it_refuses(self):
+        fitted = json.loads((self.library / self.run_import() / 'manifest.json').read_text())
+        self.assertEqual((fitted['grid']['source'], fitted['config']['bpm']), ('fitted', None))
+        # A steady 184 BPM: the fit finds no tempo inside its bounds, the owner's grid stands.
+        steady = 1.0 + np.arange(-3, 15) * 60 / 184
+        manual = self.root / 'manual'
+        with patch.object(analyze, 'extract_beats', return_value=(steady, steady[::4])):
+            with self.assertRaisesRegex(analyze.NoBeatGrid, 'outside 99-182 BPM'):
+                import_track.import_song(self.source, manual)
+            folder = manual / import_track.import_song(self.source, manual, bpm=184, first_downbeat=1.0)
+        analysis = json.loads((folder / 'analysis.json').read_text())
+        self.assertEqual((analysis['bpm'], analysis['firstDownbeat']), (184.0, 1.0))
+        self.assertEqual(analysis['beats'][3], {'t': 1.0, 'bar': 1, 'beat': 1, 'confidence': 1.0})
+        self.assertEqual(pcav.read_pcav_file(folder / 'analysis.pcav').beats.first_downbeat_index, 3)
+        manifest = json.loads((folder / 'manifest.json').read_text())
+        self.assertEqual((manifest['grid']['source'], manifest['config']['bpm']), ('manual', 184))
+        self.assertEqual((manifest['grid']['inferredBeatCount'], manifest['grid']['residualMs']), (1, 0.0))
+
+    def test_manual_grid_needs_no_detections(self):
+        for detections in (np.array([]), np.array([1.0, 1.5, 2.0])):
+            library = self.root / f'manual-{len(detections)}'
+            with self.subTest(count=len(detections)), \
+                    patch.object(analyze, 'extract_beats', return_value=(detections, detections[:1])):
+                folder = library / import_track.import_song(self.source, library, bpm=120, first_downbeat=0.5)
+                beats = json.loads((folder / 'analysis.json').read_text())['beats']
+                self.assertEqual([b['t'] for b in beats], [i * 0.5 for i in range(12)])
+                self.assertEqual([b['t'] for b in beats if b['confidence'] > 0.5], list(detections))
+                self.assertEqual({b['confidence'] for b in beats if b['t'] not in detections}, {0.5})
+                manifest = json.loads((folder / 'manifest.json').read_text())
+                self.assertEqual(manifest['grid']['inferredBeatCount'], 12 - len(detections))
+
+    def test_manual_bpm_needs_a_first_downbeat_inside_the_audio(self):
+        with self.assertRaises(SystemExit) as usage, redirect_stderr(io.StringIO()) as usage_text:
+            self.cli(self.source, '--bpm', '184')
+        self.assertEqual(usage.exception.code, 2)
+        self.assertIn('--bpm requires --first-downbeat', usage_text.getvalue())
+        with self.assertRaisesRegex(ValueError, 'A manual BPM requires the first downbeat'):
+            self.run_import(bpm=184)
+        for value in (6.0, -0.1, float('nan')):
+            with self.subTest(value=value), self.assertRaisesRegex(analyze.NoBeatGrid, 'first downbeat .* outside'):
+                self.run_import(bpm=184, first_downbeat=value)
+        with self.assertRaises(SystemExit) as refused:
+            self.cli(self.source, '--bpm', '184', '--first-downbeat', '7')
+        self.assertEqual(refused.exception.code, 'Error: refused Original song.wav: no beat grid: first downbeat '
+                                                 '7.0 s lies outside the 6.000 s audio; nothing written')
+        self.assertNothingPublished()
 
     def test_failures_preserve_previous_and_never_publish_new(self):
         with self.assertRaises(Exception): self.run_import(title='')
