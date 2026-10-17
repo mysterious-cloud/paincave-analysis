@@ -114,9 +114,10 @@ VOCALS_CHUNK = 300  # seconds separated at a time: a 45-minute class would need 
 VOCALS_CONTEXT = 10  # seconds either side of a chunk, heard but dropped, so its edges sound like its middle
 
 
-def separate_vocals(mix: np.ndarray, report: Progress = lambda _fraction: None) -> np.ndarray:
+def separate_vocals(mix: np.ndarray, report: Progress = lambda _fraction: None, stereo: bool = False) -> np.ndarray:
     """
-    The vocals of a (2, samples) mix at 44.1 kHz, mono float32, for a recording of any length. `htdemucs_ft` weighs
+    The vocals of a (2, samples) mix at 44.1 kHz, float32: mono, or (2, samples) with `stereo` (to take them out of the
+    mix), for a recording of any length. `htdemucs_ft` weighs
     each stem by one of its four models alone (one-hot weights), so its vocals model run by itself gives the bag's
     vocals for a quarter of the time. Separated in chunks, each with context either side.
     """
@@ -141,7 +142,7 @@ def separate_vocals(mix: np.ndarray, report: Progress = lambda _fraction: None) 
     wav = (wav - mean) / std
     length, chunk, context = wav.shape[1], VOCALS_CHUNK * RATE, VOCALS_CONTEXT * RATE
     starts = range(0, length, chunk)
-    vocals = np.zeros(length, dtype=np.float32)
+    vocals = np.zeros((2, length) if stereo else length, dtype=np.float32)
     original_tqdm = apply.tqdm.tqdm
     try:
         for done, start in enumerate(starts):
@@ -150,8 +151,8 @@ def separate_vocals(mix: np.ndarray, report: Progress = lambda _fraction: None) 
             with torch.no_grad():
                 out = apply.apply_model(model, wav[None, :, heard_from:min(length, end + context)], device=_device(),
                                         shifts=0, split=True, overlap=OVERLAP, progress=True)[0]
-            voice = (out[model.sources.index("vocals")] * std + mean).mean(0).numpy()
-            vocals[start:end] = voice[start - heard_from:end - heard_from]
+            voice = (out[model.sources.index("vocals")] * std + mean).numpy()
+            vocals[..., start:end] = (voice if stereo else voice.mean(0))[..., start - heard_from:end - heard_from]
     finally:
         apply.tqdm.tqdm = original_tqdm
     return vocals

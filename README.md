@@ -120,6 +120,16 @@ whisper.cpp's flags were measured on THE TRIP 43 and a 45-minute Apple Fitness c
 
 Progress goes to stdout as `PROGRESS {"stage": "voice" | "words", "fraction"}` lines; the VTT starts with a `NOTE` saying how it was made and is written whole or not at all; exit 1 with the reason (no model, not audio, whisper failed). Against THE TRIP 43's real subtitles: 99% of the coach's 591 lines heard, 92% of their words, lines as long as theirs (median 1.7 s, 4 words); 38 of 548 lines aren't in them (lyrics, and calls the subtitles leave out). Singing lands in the vocals stem, so songs with more of it bring more lyrics through.
 
+## Remove voice (a class song without the coach)
+
+For Studio's *Without the coach* (paincave `docs/studio.md`, phase 2b): Demucs `htdemucs_ft`'s stereo vocals subtracted from a song only inside the given spans (where the coach talks), with 100 ms fades; outside them the output is the input sample for sample. The vocals are resampled back to the song's own rate (ffmpeg), and the result keeps its rate and channels, written as 16-bit PCM whole or not at all.
+
+```bash
+bin/remove-voice "Class · 02.wav" -o "Class · 02.nocoach.wav" --spans spans.json   # [[start, end], …] in seconds; 13 s for a 3-minute song on an M1 Max
+```
+
+Progress as `PROGRESS` lines; exit 1 with the reason (bad spans, not audio). On THE TRIP 43's song 02, whisper.cpp heard 97% of the coach's words before and 5% after. Singing under a span goes too (the vocals stem holds both). Needs the `reference` group (Demucs).
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm
