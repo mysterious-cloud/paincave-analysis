@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pain Cave Analysis — a track's audio.m4a tags from its metadata.json and artwork (docs/output-formats.md → audio.m4a tags)
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$PROJECT_DIR" python "$PROJECT_DIR/src/tag_track.py" "$@"

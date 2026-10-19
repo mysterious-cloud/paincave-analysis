@@ -10,6 +10,7 @@ dependencies = [
     "scipy>=1.11.0",
     "numpy>=1.24.0",
     "jsonschema>=4.0.0",
+    "mutagen>=1.47",
 ]
 
 [tool.pytest.ini_options]

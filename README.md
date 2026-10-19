@@ -131,6 +131,15 @@ bin/separate-coach THE_TRIP_43.m4a --spans spans.json -o THE_TRIP_43.music.flac 
 
 ffmpeg decodes the recording (any format it reads, `.m4a` included) at its own rate and channels, mono or stereo, and the vocals are resampled back to that rate; both files keep it, as 16-bit FLAC, both written before either replaces anything, so a failure leaves neither half-done. The recording is streamed a block at a time; only the vocals are held whole. On a synthetic 45-minute stereo 48 kHz file on an M1 Max: 2½ min, peak 4.3 GB, all of it in the Demucs pass (10 minutes: 37 s, 2.4 GB). Progress as `PROGRESS {"stage": "voice", "fraction"}` lines; exit 1 with one `Error: <reason>` line on stderr (bad spans, not audio, an output over the input, ffmpeg failed). Needs the `reference` group (Demucs).
 
+## Tag track (audio.m4a tags)
+
+A track's `audio.m4a` tags from its `metadata.json` and `thumb.avif` ([output-formats.md → audio.m4a tags](docs/output-formats.md#audiom4a-tags)). paincave's `bin/import.sh`, `bin/thumbnail.sh` and Studio run it through `../paincave/bin/tag.sh`, which passes its genre list.
+
+```bash
+bin/tag-track library/2f98fdc89607 --genres ../paincave/shared/data/genres.json           # Tagged: / Up to date:
+bin/tag-track library/*/ --genres ../paincave/shared/data/genres.json --check             # Stale: …, exit 1 when any
+```
+
 ## Docs
 
 - [docs/output-formats.md](docs/output-formats.md): track directory, `metadata.json`, work zones, hash algorithm

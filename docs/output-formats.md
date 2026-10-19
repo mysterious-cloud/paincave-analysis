@@ -63,6 +63,26 @@ Beats come from [Beat This!](https://github.com/CPJKU/beat_this) (CPJKU, MIT), c
 
 AAC at 256 kbps, first audio stream, `+faststart`. The same ffmpeg process measures loudness (`ebur128=peak=true`) from its decode of the master. Probe must find a positive audio duration within 50 ms of the analyzed master. The source and master are not loudness-normalized. Browser edit-list/alignment checks are recorded in the main architecture document.
 
+### audio.m4a tags
+
+Written by `src/tag_track.py` (`bin/tag-track`) after the import and whenever the track's metadata or artwork changes (paincave's `bin/import.sh`, `bin/thumbnail.sh` and Studio, through `bin/tag.sh`), so the file reads right in any player or DJ tool. `metadata.json` stays the truth; the tags are its copy.
+
+| Tag | From | When |
+|---|---|---|
+| `©nam` | `title` | always |
+| `©ART` | `artist` (default `Pain Cave`) | always |
+| `©day` | `createdAt`'s date | always |
+| `©gen` | `genres`, as their names (one value each) | when it has genres |
+| `tmpo` | `bpm` rounded (MP4 `tmpo` is a whole number) | when `bpm` |
+| `©alb` | `cutFrom` (the class a song was cut from) | when present |
+| `covr` | `thumb.avif` as JPEG | when the track has artwork |
+| `----:com.paincave:COVER` | `thumb.avif`'s SHA-256: tells whether `covr` is current without converting the artwork again (or relying on ffmpeg's JPEG bytes staying the same) | when the track has artwork |
+| `----:com.paincave:HASH` | `hash` | always |
+| `----:com.paincave:BPM` | `bpm`, 2 decimals | when `bpm` |
+| `----:com.paincave:SOURCE`, `SOURCE_ID` | `source`, `sourceId` | when present |
+
+A tag in the table whose field is empty is removed. `©cmt` (SUNO's `made with suno; created=…; id=…`) and `©too` stay as the encode wrote them. Only the tags change: the tagger writes a copy beside the file, checks its audio packets (ffmpeg `-c copy -f md5`) and duration equal the original's, then renames it over; a file already carrying its tags is not written, and SIGTERM unwinds and removes the copy. A folder that can't be tagged prints `Error: <dir>: <reason>` and the run exits 1 after the others. mutagen edits the atoms in place; an ffmpeg remux was tried and rejected (it moved the duration by 21 µs and dropped `tmpo` and freeform tags). `manifest.json`'s `artifacts` checksums are the files as the import wrote them, before tagging; nothing reads them back.
+
 ## analysis.pcav
 
 PCAV v2: exact duration, BPM/key, absolute beat times with first-downbeat index/meter, editor peaks (0x03) and overview peaks (0x08) with explicit rate/window. Peaks are computed from 300 Hz low-pass filtered audio, normalized to full scale. Full spec: [pcav-format.md](pcav-format.md).
