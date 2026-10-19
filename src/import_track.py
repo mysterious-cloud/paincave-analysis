@@ -480,6 +480,8 @@ def import_song(
                 "createdAt": suno_meta.get("created") or existing_meta.get("createdAt") or get_file_created_time(
                     retained_source),
                 "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                # Set in Studio, never by analysis: a reimport keeps them
+                **{k: existing_meta[k] for k in ("song", "version", "cutFrom") if k in existing_meta},
             }
             validate_json(metadata, "metadata")
             write_json(stage / "metadata.json", metadata)

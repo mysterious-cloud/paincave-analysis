@@ -471,6 +471,9 @@ class PipelineTests(unittest.TestCase):
         (folder / 'thumb.avif').write_bytes(b'keep')
         (folder / 'thumbnail.json').write_text('{}')
         created = json.loads((folder / 'metadata.json').read_text())['createdAt']
+        # Studio's song and recording, written into the metadata after the first import
+        lineage = {'song': 'Touch Screen', 'version': 'Minimal Techno', 'cutFrom': 'THE TRIP 43'}
+        (folder / 'metadata.json').write_text(json.dumps({**json.loads((folder / 'metadata.json').read_text()), **lineage}))
         with patch.object(analyze, 'extract_beats', side_effect=zoned):
             self.cli(folder / 'original.wav', '--force')
         with self.assertRaisesRegex(ValueError, '--replace requires --force'):
@@ -497,6 +500,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(json.loads((folder / 'plan_workzones.json').read_text())['zones'], ZONED_ZONES)
         meta = json.loads((folder / 'metadata.json').read_text())
         self.assertEqual((meta['title'], meta['createdAt']), ('Renamed', created))
+        self.assertEqual({k: meta[k] for k in lineage}, lineage)
         self.assertEqual((folder / 'thumb.avif').read_bytes(), b'keep')
         self.assertEqual((folder / 'thumbnail.json').read_text(), '{}')
         self.assertEqual((folder / 'plans/authored.json').read_text(), 'authored')
